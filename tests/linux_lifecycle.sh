@@ -95,7 +95,7 @@ if listening 39183; then fail "protected listener opened after guard failure"; f
 rm "$guard_dropin/fail-start.conf"
 rmdir "$guard_dropin"
 systemctl daemon-reload
-systemctl reset-failed "${guard}.service"
+systemctl reset-failed "${guard}.service" "$service"
 systemctl start "$service"
 wait_for_listener 39183 || fail "listener did not recover with its guard"
 "$ctl" modify socks-39183 --remark ci-protected >/dev/null
@@ -118,12 +118,17 @@ cat >"$main_dropin/ci-start-failure.conf" <<'UNIT'
 ExecStartPre=/bin/sh -c 'if test -f /var/lib/sing-box/.ci-fail-first-start; then rm /var/lib/sing-box/.ci-fail-first-start; exit 1; fi'
 UNIT
 systemctl daemon-reload
+# Earlier scenarios restart this same unit. Give the injected failure and its
+# rollback a fresh start counter while keeping the runner's normal rate limit.
+systemctl reset-failed "$service"
 if "$ctl" regen >/dev/null; then fail "regen accepted an unsuccessful service start"; fi
+[[ ! -e /var/lib/sing-box/.ci-fail-first-start ]] || fail "candidate never reached the injected start failure"
 [[ $(sha256sum "$config"/conf/*.json "$config"/meta/*.json) == "$before" ]] || fail "service rollback changed original files"
 systemctl is-active --quiet "$service" && wait_for_listener 39182 || fail "rollback lost original service"
 rm "$main_dropin/ci-start-failure.conf"
 rmdir "$main_dropin"
 systemctl daemon-reload
+systemctl reset-failed "$service"
 "$ctl" regen >/dev/null
 systemctl is-active --quiet "$service" && listening 39183 || fail "regen lost listener"
 "$ctl" del socks-39183 >/dev/null
