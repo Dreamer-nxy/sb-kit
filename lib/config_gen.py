@@ -18,6 +18,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import secrets
 import shutil
 import string
@@ -61,13 +62,65 @@ def format_host_for_uri(host: str) -> str:
 
 
 def atomic_write_json(path: Path, data: Dict[str, Any], mode: int = 0o640) -> None:
+    """Write JSON atomically; the temp file is created with the final mode (no umask window)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-        fh.write("\n")
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+_X25519_P = 2 ** 255 - 19
+_X25519_A24 = 121665
+
+
+def x25519(scalar: bytes, u_point: bytes) -> bytes:
+    """RFC 7748 X25519 (pure Python, constant-structure Montgomery ladder)."""
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    n = int.from_bytes(k, "little")
+    p = _X25519_P
+    x1 = int.from_bytes(u_point, "little") & ((1 << 255) - 1)
+    x2, z2, x3, z3 = 1, 0, x1, 1
+    swap = 0
+    for t in reversed(range(255)):
+        bit = (n >> t) & 1
+        swap ^= bit
+        if swap:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a = (x2 + z2) % p
+        aa = a * a % p
+        b = (x2 - z2) % p
+        bb = b * b % p
+        e = (aa - bb) % p
+        c = (x3 + z3) % p
+        d = (x3 - z3) % p
+        da = d * a % p
+        cb = c * b % p
+        x3 = (da + cb) ** 2 % p
+        z3 = x1 * (da - cb) ** 2 % p
+        x2 = aa * bb % p
+        z2 = e * (aa + _X25519_A24 * e) % p
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
 def generate_reality_keypair(sb_bin: Optional[str]) -> Tuple[str, str]:
@@ -81,10 +134,35 @@ def generate_reality_keypair(sb_bin: Optional[str]) -> Tuple[str, str]:
                 pub = line.split(":", 1)[1].strip()
         if priv and pub:
             return priv, pub
-    # Fallback for local dry-run/unit-test environments without sing-box installed.
-    priv = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
-    pub = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
-    return priv, pub
+    # No sing-box binary (dry-run / CI): derive a *real* X25519 keypair in pure Python,
+    # so --generate-only links are actually usable.
+    priv_raw = bytearray(secrets.token_bytes(32))
+    priv_raw[0] &= 248
+    priv_raw[31] &= 127
+    priv_raw[31] |= 64
+    pub_raw = x25519(bytes(priv_raw), (9).to_bytes(32, "little"))
+    return _b64url(bytes(priv_raw)), _b64url(pub_raw)
+
+
+def normalize_ip_list(raw: str) -> Tuple[List[str], List[str]]:
+    """Validate a comma/space separated IP/CIDR list; return (v4_list, v6_list)."""
+    import ipaddress
+
+    v4: List[str] = []
+    v6: List[str] = []
+    for item in raw.replace(";", ",").replace(" ", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+        except ValueError as exc:
+            raise ValueError(f"invalid IP/CIDR: {item!r}") from exc
+        text = str(net.network_address) if net.num_addresses == 1 else str(net)
+        target = v4 if net.version == 4 else v6
+        if text not in target:
+            target.append(text)
+    return v4, v6
 
 
 def generate_self_signed_cert(state_dir: Path, tag: str) -> Tuple[str, str, str]:
@@ -100,6 +178,9 @@ def generate_self_signed_cert(state_dir: Path, tag: str) -> Tuple[str, str, str]
             [
                 "openssl", "req", "-x509", "-newkey", "ec",
                 "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                # Force named-curve encoding: LibreSSL/old OpenSSL may emit explicit
+                # EC params, which Go's crypto/x509 (sing-box) rejects.
+                "-pkeyopt", "ec_param_enc:named_curve",
                 "-days", days, "-nodes",
                 "-keyout", str(key_path),
                 "-out", str(cert_path),
@@ -134,9 +215,10 @@ def build_tls_object(
     cf_token: str = "",
     self_signed: bool = False,
     alpn: Optional[List[str]] = None,
+    reuse_self_signed: Optional[Tuple[str, str, str]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     tls: Dict[str, Any] = {"enabled": True}
-    extra_meta: Dict[str, Any] = {"tls_mode": "acme", "pin_sha256": ""}
+    extra_meta: Dict[str, Any] = {"tls_mode": "acme", "pin_sha256": "", "cf_token": ""}
     if alpn:
         tls["alpn"] = alpn
 
@@ -149,11 +231,18 @@ def build_tls_object(
         return tls, extra_meta
 
     if self_signed or not domain:
-        cert_path, key_path, pin = generate_self_signed_cert(state_dir, tag)
+        if reuse_self_signed and all(reuse_self_signed[:2]) and \
+                os.path.isfile(reuse_self_signed[0]) and os.path.isfile(reuse_self_signed[1]):
+            # Keep the existing cert so pinSHA256 stays stable across modify.
+            cert_path, key_path, pin = reuse_self_signed
+        else:
+            cert_path, key_path, pin = generate_self_signed_cert(state_dir, tag)
         tls["certificate_path"] = cert_path
         tls["key_path"] = key_path
         extra_meta["tls_mode"] = "self-signed"
         extra_meta["pin_sha256"] = pin
+        extra_meta["self_cert"] = cert_path
+        extra_meta["self_key"] = key_path
         return tls, extra_meta
 
     tls["server_name"] = domain
@@ -172,6 +261,8 @@ def build_tls_object(
             "api_token": cf_token,
         }
         extra_meta["tls_mode"] = "acme-dns01"
+        # Persist in root-only (0600) meta so modify/regen never silently drops DNS-01.
+        extra_meta["cf_token"] = cf_token
 
     if (major, minor) >= (1, 14):
         acme_cfg["type"] = "acme"
@@ -282,9 +373,8 @@ def format_uri(meta: Dict[str, Any]) -> Tuple[str, List[str]]:
 
     if proto == "ss2022":
         host = format_host_for_uri(ip)
-        userinfo = base64.urlsafe_b64encode(
-            f"{meta['method']}:{meta['password']}".encode("utf-8")
-        ).decode("ascii").rstrip("=")
+        # SIP002: AEAD-2022 userinfo must be percent-encoded plain text, not base64.
+        userinfo = urllib.parse.quote(f"{meta['method']}:{meta['password']}", safe="")
         return f"ss://{userinfo}@{host}:{port}#{remark}", extras
 
     if proto == "socks":
@@ -314,6 +404,7 @@ def build_inbound_and_meta(
     cf_token: str = "",
     self_signed: bool = False,
     hop_range: str = "",
+    masquerade: str = "",
     whitelist: str = "",
     remark: str = "",
     existing_meta: Optional[Dict[str, Any]] = None,
@@ -340,6 +431,18 @@ def build_inbound_and_meta(
         "remark": final_remark,
         "sb_ver": sb_ver,
     }
+
+    wl_v4, wl_v6 = normalize_ip_list(whitelist or "")
+    norm_wl = ",".join(wl_v4 + wl_v6)
+
+    reuse_ss: Optional[Tuple[str, str, str]] = None
+    if existing_meta and not rotate_creds and existing_meta.get("tls_mode") == "self-signed":
+        old_tag = existing_meta.get("tag", "")
+        reuse_ss = (
+            existing_meta.get("self_cert") or str(state_dir / "certs" / f"{old_tag}.crt"),
+            existing_meta.get("self_key") or str(state_dir / "certs" / f"{old_tag}.key"),
+            existing_meta.get("pin_sha256", ""),
+        )
 
     if proto == "vless-reality":
         if not sni:
@@ -403,6 +506,7 @@ def build_inbound_and_meta(
             key=key,
             email=email,
             cf_token=cf_token,
+            reuse_self_signed=reuse_ss,
             self_signed=self_signed,
             alpn=["h3"],
         )
@@ -415,6 +519,8 @@ def build_inbound_and_meta(
             "users": [{"name": "default", "password": password}],
             "tls": tls,
         }
+        if masquerade:
+            inbound["masquerade"] = masquerade
         meta.update({
             "password": password,
             "domain": domain,
@@ -422,6 +528,7 @@ def build_inbound_and_meta(
             "key": key,
             "email": email,
             "hop_range": hop_range,
+            "masquerade": masquerade,
             **tls_meta,
         })
 
@@ -447,6 +554,7 @@ def build_inbound_and_meta(
             key=key,
             email=email,
             cf_token=cf_token,
+            reuse_self_signed=reuse_ss,
             self_signed=False,
         )
         inbound = {
@@ -483,6 +591,7 @@ def build_inbound_and_meta(
             key=key,
             email=email,
             cf_token=cf_token,
+            reuse_self_signed=reuse_ss,
             self_signed=self_signed,
         )
         inbound = {
@@ -520,7 +629,7 @@ def build_inbound_and_meta(
         meta.update({
             "method": method,
             "password": password,
-            "whitelist": whitelist,
+            "whitelist": norm_wl,
         })
 
     elif proto == "socks":
@@ -544,7 +653,7 @@ def build_inbound_and_meta(
         meta.update({
             "username": username,
             "password": password,
-            "whitelist": whitelist,
+            "whitelist": norm_wl,
         })
 
     else:
@@ -554,34 +663,121 @@ def build_inbound_and_meta(
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    tag, conf_obj, meta = build_inbound_and_meta(
-        proto=args.proto,
-        port=args.port,
-        ip=args.ip,
-        country=args.country,
-        sb_ver=args.sb_ver,
-        state_dir=Path(args.state_dir),
-        sb_bin=args.sb_bin,
-        sni=args.sni,
-        domain=args.domain,
-        cert=args.cert,
-        key=args.key,
-        email=args.email,
-        cf_token=args.cf_token,
-        self_signed=args.self_signed,
-        hop_range=args.hop_range,
-        whitelist=args.whitelist,
-        remark=args.remark,
-    )
-    atomic_write_json(Path(args.conf_dir) / f"{tag}.json", conf_obj, mode=0o640)
-    atomic_write_json(Path(args.meta_dir) / f"{tag}.json", meta, mode=0o600)
+    try:
+        tag, conf_obj, meta = build_inbound_and_meta(
+            proto=args.proto,
+            port=args.port,
+            ip=args.ip,
+            country=args.country,
+            sb_ver=args.sb_ver,
+            state_dir=Path(args.state_dir),
+            sb_bin=args.sb_bin,
+            sni=args.sni,
+            domain=args.domain,
+            cert=args.cert,
+            key=args.key,
+            email=args.email,
+            cf_token=args.cf_token,
+            self_signed=args.self_signed,
+            hop_range=args.hop_range,
+            masquerade=args.masquerade,
+            whitelist=args.whitelist,
+            remark=args.remark,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    conf_path = Path(args.conf_dir) / f"{tag}.json"
+    meta_path = Path(args.meta_dir) / f"{tag}.json"
+    if (conf_path.exists() or meta_path.exists()) and not args.force:
+        print(f"ERROR: node {tag} already exists (use modify, or del first)", file=sys.stderr)
+        return 1
+    atomic_write_json(conf_path, conf_obj, mode=0o640)
+    atomic_write_json(meta_path, meta, mode=0o600)
 
     uri, extras = format_uri(meta)
     print(f"TAG={tag}")
+    print(f"WHITELIST={meta.get('whitelist', '')}")
     print(f"URI={uri}")
     for line in extras:
         print(line)
     return 0
+
+
+def read_conf_cf_token(conf_path: Path) -> str:
+    """Recover a Cloudflare DNS-01 token from an existing inbound conf (legacy metas)."""
+    try:
+        data = json.loads(conf_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    for ib in data.get("inbounds", []):
+        tls = ib.get("tls", {}) or {}
+        for key in ("certificate_provider", "acme"):
+            prov = tls.get(key)
+            if isinstance(prov, dict):
+                token = (prov.get("dns01_challenge") or {}).get("api_token", "")
+                if token:
+                    return token
+    return ""
+
+
+def rebuild_from_meta(
+    old_meta: Dict[str, Any],
+    conf_dir: Path,
+    state_dir: Path,
+    sb_ver: str,
+    sb_bin: Optional[str],
+    port: int = 0,
+    sni: str = "",
+    domain: str = "",
+    cf_token: str = "",
+    remark: str = "",
+    hop_range: Optional[str] = None,
+    clear_hop_range: bool = False,
+    masquerade: Optional[str] = None,
+    whitelist: Optional[str] = None,
+    clear_whitelist: bool = False,
+    rotate_creds: bool = False,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    old_tag = old_meta["tag"]
+    token = (
+        cf_token
+        or old_meta.get("cf_token", "")
+        or read_conf_cf_token(conf_dir / f"{old_tag}.json")
+    )
+    new_whitelist = (
+        "" if clear_whitelist
+        else (whitelist if whitelist is not None else old_meta.get("whitelist", ""))
+    )
+    new_hop_range = (
+        "" if clear_hop_range
+        else (hop_range if hop_range is not None else old_meta.get("hop_range", ""))
+    )
+    new_masquerade = (
+        masquerade if masquerade is not None else old_meta.get("masquerade", "")
+    )
+    return build_inbound_and_meta(
+        proto=old_meta["proto"],
+        port=port or int(old_meta["port"]),
+        ip=old_meta["ip"],
+        country=old_meta.get("country", "VPS"),
+        sb_ver=sb_ver or old_meta.get("sb_ver", "1.14.4"),
+        state_dir=state_dir,
+        sb_bin=sb_bin,
+        sni=sni or old_meta.get("sni", ""),
+        domain=domain or old_meta.get("domain", ""),
+        cert=old_meta.get("cert", ""),
+        key=old_meta.get("key", ""),
+        email=old_meta.get("email", ""),
+        cf_token=token,
+        self_signed=(old_meta.get("tls_mode") == "self-signed"),
+        hop_range=new_hop_range,
+        masquerade=new_masquerade,
+        whitelist=new_whitelist,
+        remark=remark,
+        existing_meta=old_meta,
+        rotate_creds=rotate_creds,
+    )
 
 
 def cmd_modify(args: argparse.Namespace) -> int:
@@ -591,40 +787,36 @@ def cmd_modify(args: argparse.Namespace) -> int:
         return 1
 
     old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    proto = old_meta["proto"]
-    new_port = args.port if args.port else int(old_meta["port"])
-    new_sni = args.sni if args.sni else old_meta.get("sni", "")
-    new_domain = args.domain if args.domain else old_meta.get("domain", "")
-    new_whitelist = (
-        "" if args.clear_whitelist
-        else (args.whitelist if args.whitelist is not None else old_meta.get("whitelist", ""))
-    )
+    conf_dir = Path(args.conf_dir)
+    try:
+        new_tag, conf_obj, new_meta = rebuild_from_meta(
+            old_meta,
+            conf_dir=conf_dir,
+            state_dir=Path(args.state_dir),
+            sb_ver=args.sb_ver,
+            sb_bin=args.sb_bin,
+            port=args.port,
+            sni=args.sni,
+            domain=args.domain,
+            cf_token=args.cf_token or "",
+            remark=args.remark or "",
+            hop_range=args.hop_range,
+            clear_hop_range=args.clear_hop_range,
+            masquerade=args.masquerade,
+            whitelist=args.whitelist,
+            clear_whitelist=args.clear_whitelist,
+            rotate_creds=args.rotate_creds,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
-    new_tag, conf_obj, new_meta = build_inbound_and_meta(
-        proto=proto,
-        port=new_port,
-        ip=old_meta["ip"],
-        country=old_meta.get("country", "VPS"),
-        sb_ver=args.sb_ver or old_meta.get("sb_ver", "1.14.4"),
-        state_dir=Path(args.state_dir),
-        sb_bin=args.sb_bin,
-        sni=new_sni,
-        domain=new_domain,
-        cert=old_meta.get("cert", ""),
-        key=old_meta.get("key", ""),
-        email=old_meta.get("email", ""),
-        cf_token=args.cf_token or "",
-        self_signed=(old_meta.get("tls_mode") == "self-signed"),
-        hop_range=old_meta.get("hop_range", ""),
-        whitelist=new_whitelist,
-        remark=args.remark or "",
-        existing_meta=old_meta,
-        rotate_creds=args.rotate_creds,
-    )
-
-    old_conf = Path(args.conf_dir) / f"{args.tag}.json"
-    new_conf = Path(args.conf_dir) / f"{new_tag}.json"
+    old_conf = conf_dir / f"{args.tag}.json"
+    new_conf = conf_dir / f"{new_tag}.json"
     new_meta_path = Path(args.meta_dir) / f"{new_tag}.json"
+    if new_tag != args.tag and (new_conf.exists() or new_meta_path.exists()):
+        print(f"ERROR: target node {new_tag} already exists", file=sys.stderr)
+        return 1
 
     atomic_write_json(new_conf, conf_obj, mode=0o640)
     atomic_write_json(new_meta_path, new_meta, mode=0o600)
@@ -635,12 +827,47 @@ def cmd_modify(args: argparse.Namespace) -> int:
     uri, extras = format_uri(new_meta)
     print(f"OLD_TAG={args.tag}")
     print(f"TAG={new_tag}")
-    print(f"PROTO={proto}")
-    print(f"PORT={new_port}")
-    print(f"WHITELIST={new_whitelist}")
+    print(f"PROTO={new_meta['proto']}")
+    print(f"PORT={new_meta['port']}")
+    print(f"WHITELIST={new_meta.get('whitelist', '')}")
+    print(f"HOP_RANGE={new_meta.get('hop_range', '')}")
     print(f"URI={uri}")
     for line in extras:
         print(line)
+    return 0
+
+
+def cmd_regen(args: argparse.Namespace) -> int:
+    """Regenerate every inbound conf from meta (e.g. after a 1.13 -> 1.14 core upgrade)."""
+    conf_dir = Path(args.conf_dir)
+    count = 0
+    for meta in load_all_meta(Path(args.meta_dir)):
+        try:
+            tag, conf_obj, new_meta = rebuild_from_meta(
+                meta, conf_dir=conf_dir, state_dir=Path(args.state_dir),
+                sb_ver=args.sb_ver, sb_bin=args.sb_bin,
+            )
+        except (KeyError, ValueError) as exc:
+            print(f"ERROR: regen {meta.get('tag', '?')}: {exc}", file=sys.stderr)
+            return 1
+        new_meta["sb_ver"] = args.sb_ver or new_meta.get("sb_ver", "")
+        atomic_write_json(conf_dir / f"{tag}.json", conf_obj, mode=0o640)
+        atomic_write_json(Path(args.meta_dir) / f"{tag}.json", new_meta, mode=0o600)
+        print(f"REGEN={tag}")
+        count += 1
+    print(f"COUNT={count}")
+    return 0
+
+
+def cmd_normalize_ips(args: argparse.Namespace) -> int:
+    try:
+        v4, v6 = normalize_ip_list(args.ips)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"ALL={','.join(v4 + v6)}")
+    print(f"V4={', '.join(v4)}")
+    print(f"V6={', '.join(v6)}")
     return 0
 
 
@@ -674,6 +901,63 @@ def cmd_links(args: argparse.Namespace) -> int:
     return 0
 
 
+_YAML_RESERVED = {"true", "false", "yes", "no", "on", "off", "null", "y", "n"}
+
+
+def _yaml_scalar(value: Any) -> str:
+    """JSON scalars are valid YAML; this safely quotes/escapes every string."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    text = str(value)
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", text) and text.lower() not in _YAML_RESERVED:
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _yaml_proxy(m: Dict[str, Any]) -> Optional[List[Tuple[str, Any]]]:
+    proto = m["proto"]
+    name = m.get("remark", m["tag"])
+    server = m.get("domain") or m["ip"]
+    port = int(m["port"])
+    if proto == "vless-reality":
+        return [
+            ("name", name), ("type", "vless"), ("server", m["ip"]), ("port", port),
+            ("uuid", m["uuid"]), ("network", "tcp"), ("tls", True), ("udp", True),
+            ("flow", "xtls-rprx-vision"), ("servername", m["sni"]),
+            ("client-fingerprint", "chrome"),
+            ("reality-opts", [("public-key", m["public_key"]), ("short-id", m["short_id"])]),
+        ]
+    if proto in ("hy2", "anytls"):
+        items: List[Tuple[str, Any]] = [
+            ("name", name), ("type", "hysteria2" if proto == "hy2" else "anytls"),
+            ("server", server), ("port", port), ("password", m["password"]),
+        ]
+        if m.get("domain"):
+            items.append(("sni", m["domain"]))
+        if m.get("tls_mode") == "self-signed":
+            items.append(("skip-cert-verify", True))
+            if proto == "hy2" and m.get("pin_sha256"):
+                items.append(("fingerprint", m["pin_sha256"].replace(":", "").lower()))
+        if proto == "hy2" and m.get("hop_range"):
+            items.append(("ports", m["hop_range"].replace(":", "-")))
+        if proto == "anytls":
+            items.append(("udp", True))
+        return items
+    if proto == "ss2022":
+        return [
+            ("name", name), ("type", "ss"), ("server", m["ip"]), ("port", port),
+            ("cipher", m["method"]), ("password", m["password"]), ("udp", True),
+        ]
+    if proto == "socks":
+        return [
+            ("name", name), ("type", "socks5"), ("server", m["ip"]), ("port", port),
+            ("username", m["username"]), ("password", m["password"]), ("udp", True),
+        ]
+    return None
+
+
 def cmd_yaml(args: argparse.Namespace) -> int:
     items = load_all_meta(Path(args.meta_dir))
     if not items:
@@ -681,66 +965,19 @@ def cmd_yaml(args: argparse.Namespace) -> int:
         return 0
     print("proxies:")
     for m in items:
-        proto = m["proto"]
-        name = m.get("remark", m["tag"])
-        server = m.get("domain") or m["ip"]
-        port = m["port"]
-        if proto == "vless-reality":
-            print(f'  - name: "{name}"')
-            print("    type: vless")
-            print(f'    server: "{m["ip"]}"')
-            print(f"    port: {port}")
-            print(f'    uuid: "{m["uuid"]}"')
-            print("    network: tcp")
-            print("    tls: true")
-            print("    udp: true")
-            print("    flow: xtls-rprx-vision")
-            print(f'    servername: "{m["sni"]}"')
-            print("    client-fingerprint: chrome")
-            print("    reality-opts:")
-            print(f'      public-key: "{m["public_key"]}"')
-            print(f'      short-id: "{m["short_id"]}"')
-        elif proto == "hy2":
-            print(f'  - name: "{name}"')
-            print("    type: hysteria2")
-            print(f'    server: "{server}"')
-            print(f"    port: {port}")
-            print(f'    password: "{m["password"]}"')
-            if m.get("domain"):
-                print(f'    sni: "{m["domain"]}"')
-            if m.get("tls_mode") == "self-signed":
-                print("    skip-cert-verify: true")
-            if m.get("hop_range"):
-                print(f'    ports: "{m["hop_range"].replace(":", "-")}"')
-        elif proto == "anytls":
-            print(f'  - name: "{name}"')
-            print("    type: anytls")
-            print(f'    server: "{server}"')
-            print(f"    port: {port}")
-            print(f'    password: "{m["password"]}"')
-            if m.get("domain"):
-                print(f'    sni: "{m["domain"]}"')
-            if m.get("tls_mode") == "self-signed":
-                print("    skip-cert-verify: true")
-            print("    udp: true")
-        elif proto == "ss2022":
-            print(f'  - name: "{name}"')
-            print("    type: ss")
-            print(f'    server: "{m["ip"]}"')
-            print(f"    port: {port}")
-            print(f'    cipher: "{m["method"]}"')
-            print(f'    password: "{m["password"]}"')
-            print("    udp: true")
-        elif proto == "socks":
-            print(f'  - name: "{name}"')
-            print("    type: socks5")
-            print(f'    server: "{m["ip"]}"')
-            print(f"    port: {port}")
-            print(f'    username: "{m["username"]}"')
-            print(f'    password: "{m["password"]}"')
-            print("    udp: true")
-        elif proto == "naive":
-            print(f'  # "{name}" (naive 建议使用 sing-box / Shadowrocket / v2rayN 直接导入 naive+https:// 链接)')
+        fields = _yaml_proxy(m)
+        if fields is None:
+            name = m.get("remark", m["tag"]).replace("\n", " ")
+            print(f"  # {name} ({m['proto']} 请直接导入 sbctl links 输出的链接)")
+            continue
+        for i, (key, value) in enumerate(fields):
+            prefix = "  - " if i == 0 else "    "
+            if isinstance(value, list):
+                print(f"{prefix}{key}:")
+                for sub_key, sub_val in value:
+                    print(f"      {sub_key}: {_yaml_scalar(sub_val)}")
+            else:
+                print(f"{prefix}{key}: {_yaml_scalar(value)}")
     return 0
 
 
@@ -772,8 +1009,10 @@ def main() -> int:
     p_add.add_argument("--cf-token", default="")
     p_add.add_argument("--self-signed", action="store_true")
     p_add.add_argument("--hop-range", default="")
+    p_add.add_argument("--masquerade", default="")
     p_add.add_argument("--whitelist", default="")
     p_add.add_argument("--remark", default="")
+    p_add.add_argument("--force", action="store_true")
 
     p_mod = sub.add_parser("modify")
     p_mod.add_argument("--tag", required=True)
@@ -787,6 +1026,9 @@ def main() -> int:
     p_mod.add_argument("--domain", default="")
     p_mod.add_argument("--cf-token", default="")
     p_mod.add_argument("--remark", default="")
+    p_mod.add_argument("--hop-range", default=None)
+    p_mod.add_argument("--clear-hop-range", action="store_true")
+    p_mod.add_argument("--masquerade", default=None)
     p_mod.add_argument("--whitelist", default=None)
     p_mod.add_argument("--clear-whitelist", action="store_true")
     p_mod.add_argument("--rotate-creds", action="store_true")
@@ -797,7 +1039,20 @@ def main() -> int:
     p_yaml = sub.add_parser("yaml")
     p_yaml.add_argument("--meta-dir", required=True)
 
+    p_regen = sub.add_parser("regen")
+    p_regen.add_argument("--conf-dir", required=True)
+    p_regen.add_argument("--meta-dir", required=True)
+    p_regen.add_argument("--state-dir", required=True)
+    p_regen.add_argument("--sb-ver", default="")
+    p_regen.add_argument("--sb-bin", default="")
+
+    p_ips = sub.add_parser("normalize-ips")
+    p_ips.add_argument("ips")
+
     args = parser.parse_args()
+    # Secrets may be passed via environment to keep them out of `ps` / shell history.
+    if hasattr(args, "cf_token") and not args.cf_token:
+        args.cf_token = os.environ.get("SB_CF_TOKEN", "")
     if args.cmd == "base-config":
         return cmd_base_config(args)
     if args.cmd == "add":
@@ -808,6 +1063,10 @@ def main() -> int:
         return cmd_links(args)
     if args.cmd == "yaml":
         return cmd_yaml(args)
+    if args.cmd == "regen":
+        return cmd_regen(args)
+    if args.cmd == "normalize-ips":
+        return cmd_normalize_ips(args)
     return 1
 
 

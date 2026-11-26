@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  validate:
+  lint-and-unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,11 +17,38 @@ jobs:
           bash -n sbctl.sh
           bash -n deploy.sh
           bash -n lib/audit.sh
+          bash -n tests/integration_check.sh
 
       - name: ShellCheck
-        run: shellcheck -S warning sbctl.sh deploy.sh lib/audit.sh
+        run: shellcheck -S warning sbctl.sh deploy.sh lib/audit.sh tests/integration_check.sh
 
       - name: Python compile & unit tests
         run: |
           python3 -m py_compile lib/sni_probe.py lib/config_gen.py tests/test_config_gen.py
           python3 -m unittest discover -s tests -v
+
+  sing-box-integration:
+    runs-on: ubuntu-latest
+    needs: lint-and-unit
+    strategy:
+      fail-fast: false
+      matrix:
+        sing_box_version:
+          - "1.13.14"
+          - "1.14.4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download real sing-box ${{ matrix.sing_box_version }}
+        run: |
+          VER="${{ matrix.sing_box_version }}"
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+          curl -fsSL "$URL" -o /tmp/sb.tar.gz
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          chmod +x "/tmp/sing-box-${VER}-linux-amd64/sing-box"
+          "/tmp/sing-box-${VER}-linux-amd64/sing-box" version
+
+      - name: Validate all 6 protocols + modify + regen with real sing-box check
+        run: |
+          VER="${{ matrix.sing_box_version }}"
+          bash tests/integration_check.sh "/tmp/sing-box-${VER}-linux-amd64/sing-box"

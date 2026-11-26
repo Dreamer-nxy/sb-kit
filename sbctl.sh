@@ -10,11 +10,24 @@
 set -euo pipefail
 umask 022
 
+SBKIT_VERSION="0.2.0"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/lib"
 if [[ ! -d "${LIB_DIR}" && -d "/usr/local/lib/sb-kit" ]]; then
   LIB_DIR="/usr/local/lib/sb-kit"
 fi
+
+# Global temp-path registry, cleaned on any exit (including die()).
+CLEANUP_PATHS=()
+cleanup_paths() {
+  local p
+  for p in ${CLEANUP_PATHS[@]+"${CLEANUP_PATHS[@]}"}; do
+    [[ -n "$p" ]] && rm -rf -- "$p"
+  done
+  return 0
+}
+trap cleanup_paths EXIT
 
 SB_BIN="/usr/local/bin/sing-box"
 SB_USER="sing-box"
@@ -30,6 +43,9 @@ SB_BACKUP_ROOT="/var/backups/sb-kit"
 SB_UNIT="/etc/systemd/system/sing-box.service"
 SB_LOGROTATE="/etc/logrotate.d/sing-box"
 SB_CTL_DST="/usr/local/bin/sbctl"
+SB_LIB_DST="/usr/local/lib/sb-kit"
+SB_LOCK="/run/sb-kit.lock"
+NFT_DIR="/etc/nftables.d"
 
 TCPFIT_BIN="/usr/local/bin/tcpfit"
 TCPFIT_VERSION="v0.5.9"
@@ -52,6 +68,24 @@ die()  { printf '%b[x]%b %s\n' "$C_RED" "$C_NC" "$*" >&2; exit 1; }
 
 need_root() {
   [[ "$(id -u)" -eq 0 ]] || die "请使用 root 权限运行（例如 sudo sbctl ...）"
+}
+
+acquire_lock() {
+  [[ "${SB_LOCK_HELD:-0}" == "1" ]] && return 0
+  command -v flock >/dev/null 2>&1 || return 0
+  [[ "$(id -u)" -eq 0 ]] || return 0
+  mkdir -p "$(dirname "$SB_LOCK")" 2>/dev/null || return 0
+  exec 9>"$SB_LOCK" || return 0
+  flock -n 9 || die "另一个 sbctl 正在运行（锁文件: ${SB_LOCK}），请稍后再试"
+  SB_LOCK_HELD=1
+}
+
+proto_net_type() {
+  case "$1" in
+    hy2|hysteria2)       echo "udp" ;;
+    naive|ss2022|ss|socks|socks5) echo "tcp+udp" ;;
+    *)                   echo "tcp" ;;
+  esac
 }
 
 need_cmd() {
@@ -95,16 +129,27 @@ sb_version() {
 }
 
 is_port_busy() {
+  # proto: tcp | udp | tcp+udp (busy if either side is taken)
   local port="$1" proto="${2:-tcp}"
   command -v ss >/dev/null 2>&1 || return 1
+  if [[ "$proto" == "tcp+udp" ]]; then
+    is_port_busy "$port" tcp || is_port_busy "$port" udp
+    return
+  fi
   local flag="-tlnH"
   [[ "$proto" == "udp" ]] && flag="-ulnH"
   ss "$flag" 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${port}\$"
 }
 
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 && "$1" -le 65535 ]]
+}
+
 pick_free_port() {
-  local preferred="$1" proto="${2:-tcp}" non_interactive="${3:-0}"
-  if ! is_port_busy "$preferred" "$proto"; then
+  # $4 (optional): the node's own current port — treated as free (modify keeps/reuses it).
+  local preferred="$1" proto="${2:-tcp}" non_interactive="${3:-0}" self_port="${4:-}"
+  valid_port "$preferred" || die "端口必须是 1-65535 的整数: ${preferred}"
+  if [[ -n "$self_port" && "$preferred" == "$self_port" ]] || ! is_port_busy "$preferred" "$proto"; then
     echo "$preferred"
     return 0
   fi
@@ -123,7 +168,7 @@ pick_free_port() {
   while true; do
     read -rp "请输入新的空闲端口 (回车默认 ${suggestion}): " chosen
     chosen="${chosen:-$suggestion}"
-    if ! [[ "$chosen" =~ ^[0-9]+$ ]] || [[ "$chosen" -lt 1 || "$chosen" -gt 65535 ]]; then
+    if ! valid_port "$chosen"; then
       warn "端口必须是 1-65535 的整数" >&2
       continue
     fi
@@ -171,13 +216,23 @@ ensure_base_deps() {
 }
 
 install_self() {
-  if [[ "${SCRIPT_DIR}" != "/usr/local/lib/sb-kit" && -f "${SCRIPT_DIR}/sbctl.sh" ]]; then
-    mkdir -p /usr/local/lib/sb-kit
-    cp -f "${SCRIPT_DIR}/lib/"* /usr/local/lib/sb-kit/
-    chmod 755 /usr/local/lib/sb-kit/*.py /usr/local/lib/sb-kit/*.sh 2>/dev/null || true
-    cp -f "${SCRIPT_DIR}/sbctl.sh" "${SB_CTL_DST}"
-    chmod 755 "${SB_CTL_DST}"
-    ok "管理命令已就绪: ${SB_CTL_DST}"
+  # Sync this copy of sb-kit into /usr/local whenever it is run from elsewhere
+  # (e.g. deploy.sh staging dir), so the installed `sbctl` never goes stale.
+  local quiet="${1:-0}"
+  [[ "$(id -u)" -eq 0 ]] || return 0
+  [[ "${SCRIPT_DIR}" == "/usr/local/bin" || "${SCRIPT_DIR}" == "${SB_LIB_DST}" ]] && return 0
+  [[ -f "${SCRIPT_DIR}/sbctl.sh" && -d "${SCRIPT_DIR}/lib" ]] || return 0
+  local installed_ver=""
+  [[ -f "${SB_LIB_DST}/VERSION" ]] && installed_ver=$(cat "${SB_LIB_DST}/VERSION" 2>/dev/null || true)
+  mkdir -p "${SB_LIB_DST}"
+  cp -f "${SCRIPT_DIR}/lib/"* "${SB_LIB_DST}/"
+  chmod 755 "${SB_LIB_DST}"/*.py "${SB_LIB_DST}"/*.sh 2>/dev/null || true
+  printf '%s\n' "$SBKIT_VERSION" > "${SB_LIB_DST}/VERSION"
+  cp -f "${SCRIPT_DIR}/sbctl.sh" "${SB_CTL_DST}.new"
+  chmod 755 "${SB_CTL_DST}.new"
+  mv -f "${SB_CTL_DST}.new" "${SB_CTL_DST}"
+  if [[ "$quiet" != "1" || "$installed_ver" != "$SBKIT_VERSION" ]]; then
+    ok "管理命令已就绪: ${SB_CTL_DST} (sb-kit ${installed_ver:+${installed_ver} -> }${SBKIT_VERSION})"
   fi
 }
 
@@ -229,7 +284,7 @@ PY
 
   local tmpdir tarball
   tmpdir=$(mktemp -d)
-  trap 'rm -rf "${tmpdir:-}"' RETURN
+  CLEANUP_PATHS+=("$tmpdir")
   tarball="${tmpdir}/${asset_name}"
 
   info "下载 sing-box ${tag} (${asset_name})..."
@@ -250,9 +305,22 @@ PY
   [[ -n "$extracted" ]] || die "解压后未找到 sing-box 二进制"
 
   chmod 755 "$extracted"
+  "$extracted" version >/dev/null 2>&1 || die "新下载的 sing-box 二进制无法执行（架构/libc 不匹配？）"
+  # Keep the previous binary so update can roll back if the new core rejects the config.
+  [[ -x "$SB_BIN" ]] && cp -f "$SB_BIN" "${SB_BIN}.bak"
   mv -f "$extracted" "${SB_BIN}.new"
   mv -f "${SB_BIN}.new" "${SB_BIN}"
+  rm -rf "$tmpdir"
   ok "已安装 ${SB_BIN} ($(sb_version))"
+}
+
+restore_singbox_binary() {
+  if [[ -x "${SB_BIN}.bak" ]]; then
+    mv -f "${SB_BIN}.bak" "$SB_BIN"
+    warn "已回滚 sing-box 核心至: $(sb_version)"
+    return 0
+  fi
+  return 1
 }
 
 ensure_singbox_system() {
@@ -286,6 +354,19 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
 ReadWritePaths=${SB_LOG_DIR} ${SB_STATE_DIR}
 ExecStart=${SB_BIN} run -c ${SB_CONFIG} -C ${SB_CONF_DIR}
 ExecReload=/bin/kill -HUP \$MAINPID
@@ -338,16 +419,54 @@ ensure_base_config() {
   ok "基础配置与安全路由已写入: ${SB_CONFIG}（回国阻断: $([[ "$block_cn" == "1" ]] && echo 开启 || echo 关闭)）"
 }
 
+fix_runtime_perms() {
+  # conf: root:sing-box 0640 (readable by service); meta: root-only 0600 (secrets/tokens);
+  # state (certs/acme): owned by sing-box so it can read keys and write ACME data.
+  [[ -d "$SB_CONF_DIR" ]] && {
+    chown root:"$SB_GROUP" "$SB_CONF_DIR"/*.json 2>/dev/null || true
+    chmod 640 "$SB_CONF_DIR"/*.json 2>/dev/null || true
+  }
+  [[ -d "$SB_META_DIR" ]] && {
+    chown root:root "$SB_META_DIR"/*.json 2>/dev/null || true
+    chmod 600 "$SB_META_DIR"/*.json 2>/dev/null || true
+  }
+  if [[ -d "$SB_STATE_DIR" ]]; then
+    chown -R "$SB_USER":"$SB_GROUP" "$SB_STATE_DIR"
+    chmod 640 "$SB_STATE_DIR"/certs/*.key 2>/dev/null || true
+  fi
+}
+
+run_as_service_user() {
+  # Run as the service user so `check` also catches permission problems (e.g. unreadable keys).
+  if id -u "$SB_USER" >/dev/null 2>&1; then
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u "$SB_USER" -- "$@"
+      return
+    elif command -v setpriv >/dev/null 2>&1; then
+      setpriv --reuid="$SB_USER" --regid="$SB_GROUP" --init-groups -- "$@"
+      return
+    fi
+  fi
+  "$@"
+}
+
+validate_config() {
+  fix_runtime_perms
+  run_as_service_user "$SB_BIN" check -c "$SB_CONFIG" -C "$SB_CONF_DIR"
+}
+
 validate_and_restart() {
   info "执行 sing-box check 配置校验..."
-  "$SB_BIN" check -c "$SB_CONFIG" -C "$SB_CONF_DIR" || return 1
+  validate_config || return 1
   systemctl restart sing-box
-  sleep 1
-  systemctl is-active --quiet sing-box || {
-    warn "sing-box 启动失败，请查看: journalctl -u sing-box -n 30"
-    return 1
-  }
-  ok "sing-box 校验通过并已重启"
+  local i
+  for i in 1 2 3; do
+    sleep 1
+    systemctl is-active --quiet sing-box || break
+    [[ "$i" -eq 3 ]] && { ok "sing-box 校验通过并已重启"; return 0; }
+  done
+  warn "sing-box 启动失败，请查看: journalctl -u sing-box -n 30"
+  return 1
 }
 
 install_tcpfit() {
@@ -355,18 +474,18 @@ install_tcpfit() {
   touch /var/lib/tcpfit/no-telemetry
 
   if [[ -x "$TCPFIT_BIN" ]]; then
-    local cur_ver
-    cur_ver=$(grep -m1 '^VERSION=' "$TCPFIT_BIN" 2>/dev/null | cut -d'"' -f2 || true)
-    if [[ "v${cur_ver}" == "$TCPFIT_VERSION" ]]; then
-      ok "tcpfit ${TCPFIT_VERSION} 已就绪（已禁遥测）"
+    # Re-verify the pinned hash every time (a matching VERSION string proves nothing).
+    if [[ "$(sha256sum "$TCPFIT_BIN" | awk '{print $1}')" == "$TCPFIT_SHA256" ]]; then
+      ok "tcpfit ${TCPFIT_VERSION} 已就绪（SHA-256 复核通过，已禁遥测）"
       return 0
     fi
+    warn "已安装的 tcpfit 与锁定版本 ${TCPFIT_VERSION} 的 SHA-256 不一致，将重新安装"
   fi
 
   info "安装 Kylin010/tcpfit ${TCPFIT_VERSION}（强校 SHA-256 + 禁用遥测）..."
   local tmp
   tmp=$(mktemp "/usr/local/bin/.tcpfit.XXXXXX")
-  trap 'rm -f "${tmp:-}"' RETURN
+  CLEANUP_PATHS+=("$tmp")
   curl -fsSL --max-time 30 "$TCPFIT_URL" -o "$tmp" || die "下载 tcpfit 失败"
 
   local actual_sha
@@ -381,6 +500,7 @@ install_tcpfit() {
 
 cmd_tune() {
   need_root
+  acquire_lock
   local bw="500" rtt="" swap_size="auto" do_rollback=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -499,96 +619,121 @@ select_reality_sni() {
   echo "$chosen"
 }
 
-remove_port_whitelist() {
-  local tag="$1"
-  local tbl="sbkit_${tag//[^a-zA-Z0-9_]/_}"
-  if systemctl list-unit-files "${tbl}.service" >/dev/null 2>&1; then
-    systemctl disable --now "${tbl}.service" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${tbl}.service" "/etc/nftables.d/${tbl}.nft"
+nft_unit_install() {
+  # $1=unit/table name  $2=description  — loads ${NFT_DIR}/$1.nft now and on every boot.
+  local name="$1" desc="$2" nft_bin
+  nft_bin=$(command -v nft)
+  cat >"/etc/systemd/system/${name}.service" <<UNIT
+[Unit]
+Description=${desc}
+After=network-pre.target
+Before=sing-box.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${nft_bin} -f ${NFT_DIR}/${name}.nft
+ExecStop=-${nft_bin} delete table inet ${name}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable "${name}.service" >/dev/null 2>&1 || true
+  systemctl restart "${name}.service"
+}
+
+nft_unit_remove() {
+  local name="$1"
+  if [[ -f "/etc/systemd/system/${name}.service" ]]; then
+    systemctl disable --now "${name}.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${name}.service"
     systemctl daemon-reload
   fi
+  rm -f "${NFT_DIR}/${name}.nft"
+  command -v nft >/dev/null 2>&1 && nft delete table inet "${name}" 2>/dev/null || true
+}
+
+whitelist_name() { local t="$1"; echo "sbkit_wl_${t//[^a-zA-Z0-9_]/_}"; }
+hopping_name()   { local t="$1"; echo "sbkit_hop_${t//[^a-zA-Z0-9_]/_}"; }
+
+normalize_ips() {
+  # Validates IP/CIDR list via Python ipaddress; prints normalized comma list or dies.
+  local raw="$1" out
+  out=$(python3 "${LIB_DIR}/config_gen.py" normalize-ips "$raw") || die "白名单格式无效: ${raw}（示例: 1.2.3.4,5.6.7.0/24,2001:db8::1）"
+  printf '%s\n' "$out" | awk -F= '$1=="ALL"{sub(/^ALL=/,""); print; exit}'
+}
+
+remove_port_whitelist() {
+  nft_unit_remove "$(whitelist_name "$1")"
 }
 
 setup_port_whitelist() {
   local tag="$1" port="$2" ips="$3"
   need_cmd nft
-  local tbl="sbkit_${tag//[^a-zA-Z0-9_]/_}"
-  mkdir -p /etc/nftables.d
-  local nft_file="/etc/nftables.d/${tbl}.nft"
-  cat >"$nft_file" <<EOF
-table inet ${tbl}
-delete table inet ${tbl}
-table inet ${tbl} {
+  local name norm v4 v6
+  name=$(whitelist_name "$tag")
+  norm=$(python3 "${LIB_DIR}/config_gen.py" normalize-ips "$ips") || die "白名单格式无效: ${ips}"
+  v4=$(printf '%s\n' "$norm" | awk -F= '$1=="V4"{sub(/^V4=/,""); print; exit}')
+  v6=$(printf '%s\n' "$norm" | awk -F= '$1=="V6"{sub(/^V6=/,""); print; exit}')
+  mkdir -p "$NFT_DIR"
+  cat >"${NFT_DIR}/${name}.nft" <<EOF2
+table inet ${name}
+delete table inet ${name}
+table inet ${name} {
     set allowed_v4 {
         type ipv4_addr
         flags interval
-        elements = { 127.0.0.0/8, ${ips} }
+        elements = { 127.0.0.0/8${v4:+, ${v4}} }
+    }
+    set allowed_v6 {
+        type ipv6_addr
+        flags interval
+        elements = { ::1${v6:+, ${v6}} }
     }
     chain input {
-        type filter hook input priority filter; policy accept;
-        tcp dport ${port} ip saddr @allowed_v4 accept
-        udp dport ${port} ip saddr @allowed_v4 accept
-        tcp dport ${port} drop
-        udp dport ${port} drop
+        type filter hook input priority filter - 5; policy accept;
+        meta l4proto { tcp, udp } th dport ${port} ip saddr @allowed_v4 accept
+        meta l4proto { tcp, udp } th dport ${port} ip6 saddr @allowed_v6 accept
+        meta l4proto { tcp, udp } th dport ${port} drop
     }
 }
-EOF
-  nft -f "$nft_file"
-  cat >"/etc/systemd/system/${tbl}.service" <<EOF
-[Unit]
-Description=sb-kit port whitelist (${tag})
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f ${nft_file}
-ExecStop=/usr/sbin/nft delete table inet ${tbl}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable "${tbl}.service" >/dev/null 2>&1 || true
-  ok "已启用来源 IP 白名单 (${ips})，仅锁定端口 ${port}"
+EOF2
+  nft -c -f "${NFT_DIR}/${name}.nft" || die "nft 白名单规则校验失败: ${NFT_DIR}/${name}.nft"
+  nft_unit_install "$name" "sb-kit port whitelist (${tag})"
+  ok "已启用来源 IP 白名单 (${v4}${v4:+${v6:+, }}${v6})，仅锁定端口 ${port} (TCP/UDP, IPv4/IPv6)"
 }
 
 remove_hy2_hopping() {
-  local tag="$1"
-  local svc="sbkit-hop-${tag//[^a-zA-Z0-9_-]/_}"
-  if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
-    systemctl disable --now "${svc}.service" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${svc}.service"
-    systemctl daemon-reload
-  fi
+  nft_unit_remove "$(hopping_name "$1")"
 }
 
 setup_hy2_hopping() {
   local tag="$1" port="$2" hop_range="$3"
-  need_cmd iptables
-  local svc="sbkit-hop-${tag//[^a-zA-Z0-9_-]/_}"
-  local start_p="${hop_range%%[:-]*}"
-  local end_p="${hop_range##*[:-]}"
-  [[ "$start_p" =~ ^[0-9]+$ && "$end_p" =~ ^[0-9]+$ && "$start_p" -lt "$end_p" ]] || die "无效端口跳跃范围: ${hop_range}（示例: 35000:36000）"
-
-  cat >"/etc/systemd/system/${svc}.service" <<EOF
-[Unit]
-Description=sb-kit Hysteria2 UDP port hopping (${start_p}:${end_p} -> ${port})
-After=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'iptables -t nat -C PREROUTING -p udp -m addrtype --dst-type LOCAL --dport ${start_p}:${end_p} -j REDIRECT --to-ports ${port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp -m addrtype --dst-type LOCAL --dport ${start_p}:${end_p} -j REDIRECT --to-ports ${port}'
-ExecStop=/bin/sh -c 'iptables -t nat -D PREROUTING -p udp -m addrtype --dst-type LOCAL --dport ${start_p}:${end_p} -j REDIRECT --to-ports ${port} 2>/dev/null || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable --now "${svc}.service"
-  ok "已启用 Hysteria2 UDP 端口跳跃: ${start_p}-${end_p} -> ${port}"
+  need_cmd nft
+  local name start_p end_p
+  name=$(hopping_name "$tag")
+  start_p="${hop_range%%[:-]*}"
+  end_p="${hop_range##*[:-]}"
+  valid_port "$start_p" && valid_port "$end_p" && [[ "$start_p" -lt "$end_p" ]] \
+    || die "无效端口跳跃范围: ${hop_range}（示例: 35000:36000）"
+  if [[ "$port" -ge "$start_p" && "$port" -le "$end_p" ]]; then
+    die "端口跳跃区间 ${start_p}-${end_p} 不能包含 hy2 监听端口 ${port}"
+  fi
+  mkdir -p "$NFT_DIR"
+  cat >"${NFT_DIR}/${name}.nft" <<EOF2
+table inet ${name}
+delete table inet ${name}
+table inet ${name} {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        udp dport ${start_p}-${end_p} fib daddr type local redirect to :${port}
+    }
+}
+EOF2
+  nft -c -f "${NFT_DIR}/${name}.nft" || die "nft 端口跳跃规则校验失败: ${NFT_DIR}/${name}.nft"
+  nft_unit_install "$name" "sb-kit Hysteria2 UDP port hopping (${start_p}-${end_p} -> ${port})"
+  ok "已启用 Hysteria2 UDP 端口跳跃 (nftables, IPv4/IPv6): ${start_p}-${end_p} -> ${port}"
 }
 
 print_node_result() {
@@ -611,8 +756,8 @@ cmd_add() {
   [[ -n "$proto" ]] || die "请指定协议: vless-reality | hy2 | naive | anytls | ss2022 | socks"
   shift
 
-  local port="" sni="" domain="" cert="" key="" email="" cf_token="" remark="" ip="" country=""
-  local hop_range="" whitelist="" self_signed=0 generate_only=0 out_dir=""
+  local port="" sni="" domain="" cert="" key="" email="" cf_token="${SB_CF_TOKEN:-}" remark="" ip="" country=""
+  local hop_range="" masquerade="" whitelist="" self_signed=0 generate_only=0 out_dir=""
   local non_interactive=0 skip_cn=0
 
   while [[ $# -gt 0 ]]; do
@@ -623,11 +768,14 @@ cmd_add() {
       --cert)            cert="$2"; shift 2 ;;
       --key)             key="$2"; shift 2 ;;
       --email)           email="$2"; shift 2 ;;
-      --cf-token)        cf_token="$2"; shift 2 ;;
+      --cf-token)
+        warn "建议通过环境变量 SB_CF_TOKEN 传递 Cloudflare Token，避免出现在命令行进程列表中"
+        cf_token="$2"; shift 2 ;;
       --remark)          remark="$2"; shift 2 ;;
       --ip)              ip="$2"; shift 2 ;;
       --country)         country="$2"; shift 2 ;;
       --hop-range)       hop_range="$2"; shift 2 ;;
+      --masquerade)      masquerade="$2"; shift 2 ;;
       --whitelist)       whitelist="$2"; shift 2 ;;
       --self-signed)     self_signed=1; shift ;;
       --generate-only)   generate_only=1; shift ;;
@@ -635,7 +783,8 @@ cmd_add() {
       --non-interactive) non_interactive=1; shift ;;
       --skip-cn)         skip_cn=1; shift ;;
       -h|--help)
-        echo "用法: sbctl add <vless-reality|hy2|naive|anytls|ss2022|socks> [--port N] [--sni HOST] [--domain HOST] [--cf-token TOKEN] [--hop-range A:B] [--whitelist IP1,IP2]"
+        echo "用法: sbctl add <vless-reality|hy2|naive|anytls|ss2022|socks> [--port N] [--sni HOST] [--domain HOST] [--hop-range A:B] [--masquerade URL] [--whitelist IP1,IP2]"
+        echo "提示: Cloudflare DNS-01 Token 建议通过环境变量 SB_CF_TOKEN 传入。"
         return 0
         ;;
       *) die "未知参数: $1" ;;
@@ -644,6 +793,7 @@ cmd_add() {
 
   if [[ "$generate_only" -eq 0 ]]; then
     need_root
+    acquire_lock
     [[ -x "$SB_BIN" ]] || die "未检测到 sing-box，请先运行: sbctl install"
   fi
 
@@ -654,7 +804,7 @@ cmd_add() {
         read -rp "请输入 VLESS-Reality 监听端口 [回车默认 443，可自由修改]: " port
       fi
       port="${port:-443}"
-      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" tcp "$non_interactive")
+      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" "$(proto_net_type "$proto")" "$non_interactive")
       sni=$(select_reality_sni "$sni" "$non_interactive" "$skip_cn")
       ;;
     hy2|hysteria2)
@@ -663,7 +813,7 @@ cmd_add() {
         read -rp "请输入 Hysteria2 UDP 监听端口 [回车默认 8443]: " port
       fi
       port="${port:-8443}"
-      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" udp "$non_interactive")
+      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" "$(proto_net_type "$proto")" "$non_interactive")
       if [[ -z "$domain" && -z "$cert" && "$self_signed" -eq 0 ]]; then
         if [[ "$non_interactive" -eq 1 || ! -t 0 ]]; then
           die "hy2 推荐提供 --domain <灰云子域名>（自动 ACME 正规证书），或显式加 --self-signed"
@@ -672,19 +822,23 @@ cmd_add() {
         [[ -z "$domain" ]] && self_signed=1
       fi
       if [[ -n "$domain" && -z "$cf_token" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
-        read -rp "Cloudflare API Token（可选，留空走 80 端口 HTTP-01 自动签发）: " cf_token
+        read -rsp "Cloudflare API Token（不回显，留空走 80 端口 HTTP-01 自动签发）: " cf_token
+        echo ""
       fi
       if [[ -z "$hop_range" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
         read -rp "UDP 端口跳跃区间（可选，如 35000:36000，留空不启用）: " hop_range
+      fi
+      if [[ -z "$masquerade" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
+        read -rp "主动探测伪装 URL（可选，如 https://www.debian.org，留空不设）: " masquerade
       fi
       ;;
     naive)
       proto="naive"
       if [[ -z "$port" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
-        read -rp "请输入 Naive 监听端口 [回车默认 8443，若 443 空闲也可填 443]: " port
+        read -rp "请输入 Naive 监听端口 [回车默认 9443，TCP+UDP，443 空闲也可填 443]: " port
       fi
-      port="${port:-8443}"
-      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" tcp "$non_interactive")
+      port="${port:-9443}"
+      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" "$(proto_net_type "$proto")" "$non_interactive")
       if [[ -z "$domain" && -z "$cert" ]]; then
         if [[ "$non_interactive" -eq 1 || ! -t 0 ]]; then
           die "naive 必须提供 --domain <灰云子域名> 或 --cert/--key"
@@ -693,22 +847,27 @@ cmd_add() {
         [[ -n "$domain" ]] || die "naive 协议必须提供域名以签发正规 TLS 证书"
       fi
       if [[ -n "$domain" && -z "$cf_token" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
-        read -rp "Cloudflare API Token（可选，留空走 80 端口 HTTP-01 自动签发）: " cf_token
+        read -rsp "Cloudflare API Token（不回显，留空走 80 端口 HTTP-01 自动签发）: " cf_token
+        echo ""
       fi
       ;;
     anytls)
       proto="anytls"
       if [[ -z "$port" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
-        read -rp "请输入 AnyTLS 监听端口 [回车默认 8443]: " port
+        read -rp "请输入 AnyTLS 监听端口 [回车默认 10443]: " port
       fi
-      port="${port:-8443}"
-      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" tcp "$non_interactive")
+      port="${port:-10443}"
+      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" "$(proto_net_type "$proto")" "$non_interactive")
       if [[ -z "$domain" && -z "$cert" && "$self_signed" -eq 0 ]]; then
         if [[ "$non_interactive" -eq 1 || ! -t 0 ]]; then
           die "anytls 推荐提供 --domain <灰云子域名>（自动 ACME），或显式加 --self-signed"
         fi
         read -rp "请输入自有域名（Cloudflare 灰云 A 记录，留空则改用随机自签证书）: " domain
         [[ -z "$domain" ]] && self_signed=1
+      fi
+      if [[ -n "$domain" && -z "$cf_token" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
+        read -rsp "Cloudflare API Token（不回显，留空走 80 端口 HTTP-01 自动签发）: " cf_token
+        echo ""
       fi
       ;;
     ss2022|ss)
@@ -718,9 +877,9 @@ cmd_add() {
         read -rp "请输入 SS-2022 监听端口 [回车默认随机 ${def_ss}]: " port
       fi
       port="${port:-$def_ss}"
-      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" tcp "$non_interactive")
+      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" "$(proto_net_type "$proto")" "$non_interactive")
       if [[ -z "$whitelist" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
-        read -rp "允许连入的前置机白名单 IP（多个用逗号分隔，留空不设）: " whitelist
+        read -rp "允许连入的前置机白名单 IP（支持 IPv4/IPv6/CIDR，逗号分隔，留空不设）: " whitelist
       fi
       ;;
     socks|socks5)
@@ -730,9 +889,9 @@ cmd_add() {
         read -rp "请输入 Socks5 监听端口 [回车默认随机 ${def_sk}]: " port
       fi
       port="${port:-$def_sk}"
-      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" tcp "$non_interactive")
+      [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" "$(proto_net_type "$proto")" "$non_interactive")
       if [[ -z "$whitelist" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
-        read -rp "来源 IP 白名单（强烈建议填写固定出口/中转 IP，多个逗号分隔，留空不设）: " whitelist
+        read -rp "来源 IP 白名单（强烈建议填写固定出口/中转 IP，支持 IPv4/IPv6，留空不设）: " whitelist
       fi
       ;;
     *)
@@ -780,14 +939,14 @@ cmd_add() {
   [[ -n "$cert" ]] && py_args+=(--cert "$cert")
   [[ -n "$key" ]] && py_args+=(--key "$key")
   [[ -n "$email" ]] && py_args+=(--email "$email")
-  [[ -n "$cf_token" ]] && py_args+=(--cf-token "$cf_token")
   [[ -n "$remark" ]] && py_args+=(--remark "$remark")
   [[ -n "$hop_range" ]] && py_args+=(--hop-range "$hop_range")
+  [[ -n "$masquerade" ]] && py_args+=(--masquerade "$masquerade")
   [[ -n "$whitelist" ]] && py_args+=(--whitelist "$whitelist")
   [[ "$self_signed" -eq 1 ]] && py_args+=(--self-signed)
 
   local gen_out tag
-  gen_out=$(python3 "${py_args[@]}")
+  gen_out=$(SB_CF_TOKEN="$cf_token" python3 "${py_args[@]}")
   tag=$(echo "$gen_out" | awk -F= '$1=="TAG"{print $2; exit}')
 
   if [[ "$generate_only" -eq 1 ]]; then
@@ -796,24 +955,34 @@ cmd_add() {
     return 0
   fi
 
-  chown root:"$SB_GROUP" "${SB_CONF_DIR}/${tag}.json"
-  chmod 640 "${SB_CONF_DIR}/${tag}.json"
-  chmod 600 "${SB_META_DIR}/${tag}.json"
-  if [[ "$self_signed" -eq 1 && -d "${SB_STATE_DIR}/certs" ]]; then
-    chown -R "$SB_USER":"$SB_GROUP" "${SB_STATE_DIR}/certs"
-    chmod 640 "${SB_STATE_DIR}/certs/"*.key 2>/dev/null || true
-  fi
-
-  if ! validate_and_restart; then
+  # Pre-check config as sing-box user, then apply firewall guard BEFORE restarting service (zero open-port window).
+  if ! validate_config; then
     rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json"
     die "新节点未通过 sing-box check，已自动回滚该节点文件"
   fi
 
+  local wl_applied=0 hop_applied=0
   if [[ ("$proto" == "ss2022" || "$proto" == "socks") && -n "$whitelist" ]]; then
-    setup_port_whitelist "$tag" "$port" "$whitelist"
+    if ! setup_port_whitelist "$tag" "$port" "$whitelist"; then
+      rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json"
+      die "白名单规则应用失败，已自动回滚该节点文件"
+    fi
+    wl_applied=1
   fi
   if [[ "$proto" == "hy2" && -n "$hop_range" ]]; then
-    setup_hy2_hopping "$tag" "$port" "$hop_range"
+    if ! setup_hy2_hopping "$tag" "$port" "$hop_range"; then
+      rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json"
+      [[ "$wl_applied" -eq 1 ]] && remove_port_whitelist "$tag"
+      die "端口跳跃规则应用失败，已自动回滚该节点文件"
+    fi
+    hop_applied=1
+  fi
+
+  if ! validate_and_restart; then
+    rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json"
+    [[ "$wl_applied" -eq 1 ]] && remove_port_whitelist "$tag"
+    [[ "$hop_applied" -eq 1 ]] && remove_hy2_hopping "$tag"
+    die "sing-box 启动失败，已自动回滚新节点与防火墙规则"
   fi
 
   print_node_result "$tag" "$gen_out"
@@ -839,6 +1008,7 @@ pick_existing_tag() {
 
 cmd_modify() {
   need_root
+  acquire_lock
   local tag="${1:-}"
   if [[ -z "$tag" || "$tag" == --* ]]; then
     tag=$(pick_existing_tag)
@@ -849,6 +1019,7 @@ cmd_modify() {
   [[ -f "${SB_META_DIR}/${tag}.json" ]] || die "找不到节点元数据: ${tag}"
 
   local new_port="" new_sni="" new_remark="" new_wl="" clear_wl=0 rotate=0
+  local new_hop="" clear_hop=0 new_masq=""
   local has_flags=0
   while [[ $# -gt 0 ]]; do
     has_flags=1
@@ -858,25 +1029,36 @@ cmd_modify() {
       --remark)          new_remark="$2"; shift 2 ;;
       --whitelist)       new_wl="$2"; shift 2 ;;
       --clear-whitelist) clear_wl=1; shift ;;
+      --hop-range)       new_hop="$2"; shift 2 ;;
+      --clear-hop-range) clear_hop=1; shift ;;
+      --masquerade)      new_masq="$2"; shift 2 ;;
       --rotate-creds)    rotate=1; shift ;;
       -h|--help)
-        echo "用法: sbctl modify <tag> [--port N] [--sni auto|HOST] [--rotate-creds] [--remark NAME] [--whitelist IP1,IP2 | --clear-whitelist]"
+        echo "用法: sbctl modify <tag> [--port N] [--sni auto|HOST] [--rotate-creds] [--remark NAME] [--whitelist IP1,IP2|--clear-whitelist] [--hop-range A:B|--clear-hop-range] [--masquerade URL]"
         return 0
         ;;
       *) die "未知参数: $1" ;;
     esac
   done
 
-  local cur_proto
-  cur_proto=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['proto'])" "${SB_META_DIR}/${tag}.json")
+  local cur_proto cur_port old_hop
+  IFS='|' read -r cur_proto cur_port old_hop < <(
+    python3 - "${SB_META_DIR}/${tag}.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1], encoding="utf-8"))
+print(f"{m.get('proto','')}|{m.get('port','')}|{m.get('hop_range','')}")
+PY
+  )
 
   if [[ "$has_flags" -eq 0 ]]; then
-    printf '\n正在修改节点 [%s] (%s):\n' "$tag" "$cur_proto"
+    printf '\n正在修改节点 [%s] (%s, 端口 %s):\n' "$tag" "$cur_proto" "$cur_port"
     printf '  1) 修改监听端口\n'
     [[ "$cur_proto" == "vless-reality" ]] && printf '  2) 更换 Reality SNI（重新测速体检或手填）\n'
-    printf '  3) 重置密钥 / UUID / 账密\n'
+    printf '  3) 重置密钥 / UUID / 账密（自签证书节点会同步重签）\n'
     printf '  4) 修改节点备注\n'
     [[ "$cur_proto" == "ss2022" || "$cur_proto" == "socks" ]] && printf '  5) 修改 / 清空来源 IP 白名单\n'
+    [[ "$cur_proto" == "hy2" ]] && printf '  6) 修改 / 清空 UDP 端口跳跃区间\n'
+    [[ "$cur_proto" == "hy2" ]] && printf '  7) 修改主动探测伪装 URL (masquerade)\n'
     local act=""
     read -rp "请选择修改项: " act
     case "$act" in
@@ -885,11 +1067,18 @@ cmd_modify() {
       3) rotate=1 ;;
       4) read -rp "请输入新备注: " new_remark ;;
       5)
-        read -rp "请输入新白名单 IP（多个逗号分隔，输入 clear 清空）: " new_wl
+        read -rp "请输入新白名单 IP（支持 IPv4/IPv6，输入 clear 清空）: " new_wl
         if [[ "$new_wl" == "clear" ]]; then
           clear_wl=1; new_wl=""
         fi
         ;;
+      6)
+        read -rp "请输入新端口跳跃区间（如 35000:36000，输入 clear 清空）: " new_hop
+        if [[ "$new_hop" == "clear" ]]; then
+          clear_hop=1; new_hop=""
+        fi
+        ;;
+      7) read -rp "请输入伪装 URL（如 https://www.debian.org，留空清除）: " new_masq ;;
       *) die "无效选择" ;;
     esac
   else
@@ -897,14 +1086,12 @@ cmd_modify() {
   fi
 
   if [[ -n "$new_port" ]]; then
-    local ptype="tcp"
-    [[ "$cur_proto" == "hy2" ]] && ptype="udp"
-    new_port=$(pick_free_port "$new_port" "$ptype" "$has_flags")
+    new_port=$(pick_free_port "$new_port" "$(proto_net_type "$cur_proto")" "$has_flags" "$cur_port")
   fi
 
   local snap_dir
   snap_dir=$(mktemp -d)
-  trap 'rm -rf "${snap_dir:-}"' RETURN
+  CLEANUP_PATHS+=("$snap_dir")
   cp -a "${SB_CONF_DIR}" "${snap_dir}/conf"
   cp -a "${SB_META_DIR}" "${snap_dir}/meta"
 
@@ -924,35 +1111,68 @@ cmd_modify() {
   [[ -n "$new_remark" ]] && py_args+=(--remark "$new_remark")
   [[ -n "$new_wl" ]] && py_args+=(--whitelist "$new_wl")
   [[ "$clear_wl" -eq 1 ]] && py_args+=(--clear-whitelist)
+  [[ -n "$new_hop" ]] && py_args+=(--hop-range "$new_hop")
+  [[ "$clear_hop" -eq 1 ]] && py_args+=(--clear-hop-range)
+  [[ -n "$new_masq" ]] && py_args+=(--masquerade "$new_masq")
   [[ "$rotate" -eq 1 ]] && py_args+=(--rotate-creds)
 
-  local gen_out new_tag final_port final_wl
+  local gen_out new_tag final_port final_wl final_hop
   gen_out=$(python3 "${py_args[@]}")
   new_tag=$(echo "$gen_out" | awk -F= '$1=="TAG"{print $2; exit}')
   final_port=$(echo "$gen_out" | awk -F= '$1=="PORT"{print $2; exit}')
-  final_wl=$(echo "$gen_out" | awk -F= '$1=="WHITELIST"{print $2; exit}')
+  final_wl=$(echo "$gen_out" | awk -F= '$1=="WHITELIST"{sub(/^WHITELIST=/,""); print; exit}')
+  final_hop=$(echo "$gen_out" | awk -F= '$1=="HOP_RANGE"{sub(/^HOP_RANGE=/,""); print; exit}')
 
-  chown root:"$SB_GROUP" "${SB_CONF_DIR}/${new_tag}.json"
-  chmod 640 "${SB_CONF_DIR}/${new_tag}.json"
-  chmod 600 "${SB_META_DIR}/${new_tag}.json"
-
-  if ! validate_and_restart; then
+  if ! validate_config; then
     rm -rf "${SB_CONF_DIR:?}"/* "${SB_META_DIR:?}"/*
     cp -a "${snap_dir}/conf/." "${SB_CONF_DIR}/"
     cp -a "${snap_dir}/meta/." "${SB_META_DIR}/"
-    systemctl restart sing-box 2>/dev/null || true
+    rm -rf "$snap_dir"
     die "修改后的配置未通过 sing-box check，已自动恢复原配置"
+  fi
+
+  # Apply new whitelist BEFORE restarting sing-box (avoid open-port window on new port).
+  local wl_new_applied=0
+  if [[ ("$cur_proto" == "ss2022" || "$cur_proto" == "socks") && -n "$final_wl" ]]; then
+    if ! setup_port_whitelist "$new_tag" "$final_port" "$final_wl"; then
+      rm -rf "${SB_CONF_DIR:?}"/* "${SB_META_DIR:?}"/*
+      cp -a "${snap_dir}/conf/." "${SB_CONF_DIR}/"
+      cp -a "${snap_dir}/meta/." "${SB_META_DIR}/"
+      rm -rf "$snap_dir"
+      die "新白名单规则应用失败，已自动恢复原配置"
+    fi
+    wl_new_applied=1
+  fi
+
+  if ! validate_and_restart; then
+    if [[ "$wl_new_applied" -eq 1 && "$new_tag" != "$tag" ]]; then
+      remove_port_whitelist "$new_tag"
+    fi
+    rm -rf "${SB_CONF_DIR:?}"/* "${SB_META_DIR:?}"/*
+    cp -a "${snap_dir}/conf/." "${SB_CONF_DIR}/"
+    cp -a "${snap_dir}/meta/." "${SB_META_DIR}/"
+    validate_config >/dev/null 2>&1 || true
+    systemctl restart sing-box 2>/dev/null || true
+    rm -rf "$snap_dir"
+    die "sing-box 启动失败，已自动恢复原配置"
   fi
 
   if [[ "$cur_proto" == "ss2022" || "$cur_proto" == "socks" ]]; then
     if [[ "$new_tag" != "$tag" || "$clear_wl" -eq 1 ]]; then
       remove_port_whitelist "$tag"
     fi
-    if [[ -n "$final_wl" ]]; then
-      setup_port_whitelist "$new_tag" "$final_port" "$final_wl"
+  fi
+
+  if [[ "$cur_proto" == "hy2" ]]; then
+    if [[ "$new_tag" != "$tag" || "$clear_hop" -eq 1 || ( -n "$old_hop" && "$final_hop" != "$old_hop" ) ]]; then
+      remove_hy2_hopping "$tag"
+    fi
+    if [[ -n "$final_hop" ]]; then
+      setup_hy2_hopping "$new_tag" "$final_port" "$final_hop"
     fi
   fi
 
+  rm -rf "$snap_dir"
   print_node_result "$new_tag" "$gen_out"
 }
 
@@ -968,6 +1188,7 @@ cmd_yaml() {
 
 cmd_del() {
   need_root
+  acquire_lock
   local target="${1:-}"
   [[ -n "$target" ]] || target=$(pick_existing_tag)
 
@@ -989,6 +1210,7 @@ cmd_del() {
 
 cmd_route() {
   need_root
+  acquire_lock
   local action="${1:-status}"
   case "$action" in
     block-cn-on)
@@ -1011,6 +1233,7 @@ cmd_route() {
 
 cmd_install() {
   need_root
+  acquire_lock
   local sb_ver="latest" proto="vless-reality" port="" sni="" domain="" ip=""
   local block_cn=0 do_tune=1 bw="500" rtt="auto" swap_size="auto"
   local non_interactive=0 skip_cn=0
@@ -1067,13 +1290,63 @@ cmd_install() {
   cmd_add "${add_args[@]}"
 }
 
+cmd_regen() {
+  need_root
+  acquire_lock
+  [[ -x "$SB_BIN" ]] || die "未检测到 sing-box，请先运行: sbctl install"
+  [[ -d "$SB_META_DIR" ]] && compgen -G "${SB_META_DIR}/*.json" >/dev/null 2>&1 || die "当前没有可重建的节点元数据"
+
+  local snap_dir sb_ver
+  snap_dir=$(mktemp -d)
+  CLEANUP_PATHS+=("$snap_dir")
+  cp -a "${SB_CONF_DIR}" "${snap_dir}/conf"
+  cp -a "${SB_META_DIR}" "${snap_dir}/meta"
+
+  sb_ver=$(sb_version)
+  info "按 sing-box ${sb_ver} 语法重建全部入站配置..."
+  local out count
+  out=$(python3 "${LIB_DIR}/config_gen.py" regen \
+    --conf-dir "$SB_CONF_DIR" \
+    --meta-dir "$SB_META_DIR" \
+    --state-dir "$SB_STATE_DIR" \
+    --sb-ver "$sb_ver" \
+    --sb-bin "$SB_BIN")
+  count=$(echo "$out" | awk -F= '$1=="COUNT"{print $2; exit}')
+
+  if ! validate_and_restart; then
+    rm -rf "${SB_CONF_DIR:?}"/* "${SB_META_DIR:?}"/*
+    cp -a "${snap_dir}/conf/." "${SB_CONF_DIR}/"
+    cp -a "${snap_dir}/meta/." "${SB_META_DIR}/"
+    validate_config >/dev/null 2>&1 || true
+    systemctl restart sing-box 2>/dev/null || true
+    rm -rf "$snap_dir"
+    die "重建后的配置未通过 sing-box check，已自动恢复原配置"
+  fi
+  rm -rf "$snap_dir"
+  ok "已按 sing-box ${sb_ver} 重建并验收 ${count:-0} 个节点配置"
+}
+
 cmd_update() {
   need_root
+  acquire_lock
   local target_ver="${1:-latest}"
   install_singbox_binary "$target_ver"
   if [[ -f "$SB_CONFIG" ]] && compgen -G "${SB_CONF_DIR}/*.json" >/dev/null 2>&1; then
-    validate_and_restart || die "升级后重启失败"
+    if ! validate_and_restart; then
+      warn "新版 sing-box 与当前配置不兼容或启动失败，正在自动回滚旧版核心..."
+      if restore_singbox_binary; then
+        validate_and_restart || warn "回滚后重启异常，请手动检查 journalctl -u sing-box"
+      fi
+      die "已中止升级并回滚核心（若是 1.13 -> 1.14 跨版本语法变更，可先确认后使用 sbctl regen）"
+    fi
   fi
+  rm -f "${SB_BIN}.bak"
+}
+
+cmd_version() {
+  local sv
+  sv=$(sb_version)
+  printf 'sb-kit %s (sing-box: %s)\n' "$SBKIT_VERSION" "${sv:-未安装}"
 }
 
 cmd_audit() {
@@ -1083,12 +1356,13 @@ cmd_audit() {
 
 cmd_uninstall() {
   need_root
+  acquire_lock
   local keep_tcpfit=0
   [[ "${1:-}" == "--keep-tcpfit" ]] && keep_tcpfit=1
 
   systemctl disable --now sing-box 2>/dev/null || true
-  rm -f "$SB_UNIT" "$SB_LOGROTATE" "$SB_BIN" "$SB_CTL_DST"
-  rm -rf "$SB_DIR" "$SB_LOG_DIR" "$SB_STATE_DIR" /usr/local/lib/sb-kit
+  rm -f "$SB_UNIT" "$SB_LOGROTATE" "$SB_BIN" "${SB_BIN}.bak" "$SB_CTL_DST"
+  rm -rf "$SB_DIR" "$SB_LOG_DIR" "$SB_STATE_DIR" "$SB_LIB_DST"
 
   local svc
   for svc in /etc/systemd/system/sbkit_*.service /etc/systemd/system/sbkit-hop-*.service; do
@@ -1096,7 +1370,7 @@ cmd_uninstall() {
     systemctl disable --now "$(basename "$svc")" 2>/dev/null || true
     rm -f "$svc"
   done
-  rm -f /etc/nftables.d/sbkit_*.nft
+  rm -f "${NFT_DIR}"/sbkit_*.nft
   systemctl daemon-reload
 
   if [[ "$keep_tcpfit" -eq 0 && -x "$TCPFIT_BIN" ]]; then
@@ -1107,22 +1381,27 @@ cmd_uninstall() {
 }
 
 show_help() {
-  cat <<'EOF'
-sbctl — 纯 sing-box + tcpfit 精简管理工具（无面板、无二维码、仅纯链接）
+  cat <<EOF
+sbctl (sb-kit ${SBKIT_VERSION}) — 纯 sing-box + tcpfit 精简管理工具（无面板、无二维码、仅纯链接）
 
 用法:
   sbctl                             打开终端可视化交互菜单
   sbctl install [选项]              一键安装 sing-box + 自动 BBR 调优 + 首个节点
   sbctl add <协议> [选项]           添加节点 (vless-reality|hy2|naive|anytls|ss2022|socks)
-  sbctl modify [tag] [选项]         修改已有节点（端口/SNI/密钥/备注/白名单）
+  sbctl modify [tag] [选项]         修改已有节点（端口/SNI/密钥/备注/白名单/跳跃/伪装）
   sbctl links                       查看全部节点链接（socks 附指纹浏览器格式）
   sbctl yaml                        按需导出 Clash/Mihomo proxies YAML 片段
   sbctl del [tag]                   删除节点
   sbctl tune [--bw N --rtt auto]    BBR/TCP 调优（支持 --rollback）
   sbctl route [block-cn-on|off]     开启/关闭回国 IP 阻断
   sbctl audit                       一键只读安全巡检
-  sbctl update [ver]                仅升级 sing-box 核心（SHA-256 校验，不覆盖配置）
+  sbctl update [ver]                仅升级 sing-box 核心（SHA-256 校验，失败自动回滚）
+  sbctl regen                       按当前 sing-box 版本语法从 meta 重建全部入站配置
+  sbctl --version                   查看 sb-kit 与 sing-box 版本
   sbctl uninstall [--keep-tcpfit]   彻底卸载
+
+环境变量:
+  SB_CF_TOKEN                       Cloudflare DNS-01 API Token（避免出现在命令行中）
 EOF
 }
 
@@ -1155,7 +1434,7 @@ interactive_menu() {
     fi
 
     printf '\n%b┌──────────────────────────────────────────────────────────────┐%b\n' "$C_CYAN" "$C_NC"
-    printf '%b│%b  %bsb-kit%b · 纯 sing-box + tcpfit 精简管理工具                 %b│%b\n' "$C_CYAN" "$C_NC" "$C_BOLD" "$C_NC" "$C_CYAN" "$C_NC"
+    printf '%b│%b  %bsb-kit v%s%b · 纯 sing-box + tcpfit 精简管理工具          %b│%b\n' "$C_CYAN" "$C_NC" "$C_BOLD" "$SBKIT_VERSION" "$C_NC" "$C_CYAN" "$C_NC"
     printf '%b├──────────────────────────────────────────────────────────────┤%b\n' "$C_CYAN" "$C_NC"
     printf '  核心: %-12s %b  |  用户: %s\n' "$ver" "$status" "${user_now:-root}"
     printf '  网络: %s + %s  |  initcwnd: %s  |  内存: %s MB\n' "$cc_algo" "$qdisc" "$initcwnd" "$mem_mb"
@@ -1163,7 +1442,7 @@ interactive_menu() {
     printf '%b├──────────────────────────────────────────────────────────────┤%b\n' "$C_CYAN" "$C_NC"
     printf '  [1]  一键安装（sing-box + 自动 BBR 调优 + 首个节点）\n'
     printf '  [2]  添加节点（VLESS-Reality / Hy2 / Naive / AnyTLS / SS / Socks）\n'
-    printf '  [3]  修改节点（改端口 / 换 SNI / 重置账密 / 改白名单）\n'
+    printf '  [3]  修改节点（改端口 / 换 SNI / 重置账密 / 改白名单或跳跃）\n'
     printf '  [4]  查看全部节点链接（纯文本直接复制；可选导出 YAML）\n'
     printf '  [5]  删除节点\n'
     printf '  %b──────────────────────────────────────────────────────────%b\n' "$C_DIM" "$C_NC"
@@ -1171,7 +1450,7 @@ interactive_menu() {
     printf '  [7]  路由开关（开启 / 关闭回国 IP 阻断）\n'
     printf '  [8]  服务管理（启动 / 停止 / 重启 / 查看错误日志）\n'
     printf '  [9]  一键安全巡检 (audit)\n'
-    printf '  [10] 仅更新 sing-box 核心（SHA-256 校验，不覆盖配置）\n'
+    printf '  [10] 核心升级 / 重建配置（update 自动回滚 / regen 跨版本同步）\n'
     printf '  [11] 彻底卸载\n'
     printf '  [0]  退出\n'
     printf '%b└──────────────────────────────────────────────────────────────┘%b\n' "$C_CYAN" "$C_NC"
@@ -1255,7 +1534,16 @@ interactive_menu() {
         esac
         ;;
       9) cmd_audit || true ;;
-      10) cmd_update || true ;;
+      10)
+        printf '  1) 仅更新 sing-box 核心（失败自动回滚）  2) 按当前核心版本重建全部配置 (regen)\n'
+        local ua=""
+        read -rp "请选择 [1-2]: " ua
+        case "$ua" in
+          1) cmd_update || true ;;
+          2) cmd_regen || true ;;
+          *) warn "无效选择" ;;
+        esac
+        ;;
       11)
         local yn=""
         read -rp "确认彻底卸载 sb-kit 与 sing-box? [y/N]: " yn
@@ -1273,6 +1561,7 @@ interactive_menu() {
 main() {
   if [[ $# -eq 0 ]]; then
     if [[ -t 0 ]]; then
+      install_self 1
       interactive_menu
     else
       show_help
@@ -1282,6 +1571,15 @@ main() {
 
   local sub="$1"
   shift
+  case "$sub" in
+    -h|--help|help)    show_help; return 0 ;;
+    -v|--version|version) cmd_version; return 0 ;;
+    uninstall)         cmd_uninstall "$@"; return 0 ;;
+  esac
+
+  # Auto-sync /usr/local/bin/sbctl when invoked as root from a staging copy (e.g. deploy.sh).
+  [[ "$sub" != "links" && "$sub" != "link" && "$sub" != "url" && "$sub" != "yaml" && "$sub" != "clash" ]] && install_self 1
+
   case "$sub" in
     install)           cmd_install "$@" ;;
     add)               cmd_add "$@" ;;
@@ -1293,8 +1591,7 @@ main() {
     route)             cmd_route "$@" ;;
     audit|check)       cmd_audit "$@" ;;
     update|up)         cmd_update "$@" ;;
-    uninstall)         cmd_uninstall "$@" ;;
-    -h|--help|help)    show_help ;;
+    regen)             cmd_regen "$@" ;;
     *) die "未知子命令: ${sub}（运行 sbctl --help 查看用法）" ;;
   esac
 }
