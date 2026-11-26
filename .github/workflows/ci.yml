@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: |
+          bash -n sbctl.sh
+          bash -n deploy.sh
+          bash -n lib/audit.sh
+
+      - name: ShellCheck
+        run: shellcheck -S warning sbctl.sh deploy.sh lib/audit.sh
+
+      - name: Python compile & unit tests
+        run: |
+          python3 -m py_compile lib/sni_probe.py lib/config_gen.py tests/test_config_gen.py
+          python3 -m unittest discover -s tests -v
