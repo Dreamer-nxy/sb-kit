@@ -10,11 +10,12 @@
 set -euo pipefail
 umask 022
 
-SBKIT_VERSION="0.2.1"
+SBKIT_VERSION="0.2.2"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LIB_DIR="${SCRIPT_DIR}/lib"
-if [[ ! -d "${LIB_DIR}" && -d "/usr/local/lib/sb-kit" ]]; then
+# The old flat installation is kept intact while its replacement is published.
+if [[ "$SCRIPT_DIR" == "/usr/local/bin" && ! -d "$LIB_DIR" ]]; then
   LIB_DIR="/usr/local/lib/sb-kit"
 fi
 
@@ -46,6 +47,7 @@ SB_LOGROTATE="/etc/logrotate.d/sing-box"
 SB_CTL_DST="/usr/local/bin/sbctl"
 SB_LIB_DST="/usr/local/lib/sb-kit"
 SB_LOCK="/run/sb-kit.lock"
+SB_LOCK_HELD=0
 NFT_DIR="/etc/nftables.d"
 
 TCPFIT_BIN="/usr/local/bin/tcpfit"
@@ -72,11 +74,9 @@ need_root() {
 }
 
 acquire_lock() {
-  [[ "${SB_LOCK_HELD:-0}" == "1" ]] && return 0
-  command -v flock >/dev/null 2>&1 || return 0
-  [[ "$(id -u)" -eq 0 ]] || return 0
-  mkdir -p "$(dirname "$SB_LOCK")" 2>/dev/null || return 0
-  exec 9>"$SB_LOCK" || return 0
+  [[ "$SB_LOCK_HELD" == "1" ]] && return 0
+  need_cmd flock
+  exec 9>>"$SB_LOCK" || die "无法打开写锁: $SB_LOCK"
   flock -n 9 || die "另一个 sbctl 正在运行（锁文件: ${SB_LOCK}），请稍后再试"
   SB_LOCK_HELD=1
 }
@@ -86,6 +86,13 @@ proto_net_type() {
     hy2|hysteria2)       echo "udp" ;;
     naive|ss2022|ss|socks|socks5) echo "tcp+udp" ;;
     *)                   echo "tcp" ;;
+  esac
+}
+
+require_supported_protocol() {
+  case "$1" in
+    vless-reality|reality|vless|hy2|hysteria2|naive|anytls|ss2022|ss|socks|socks5) ;;
+    *) die "不支持的协议: $1" ;;
   esac
 }
 
@@ -218,25 +225,23 @@ ensure_base_deps() {
   fi
 }
 
+is_staging_copy() {
+  [[ "$SCRIPT_DIR" != "${SB_CTL_DST%/*}" && "$SCRIPT_DIR" != "$SB_LIB_DST" &&
+     ! -f "$SCRIPT_DIR/.sb-kit-manifest" && -f "$SCRIPT_DIR/sbctl.sh" ]]
+}
+
 install_self() {
-  # Sync this copy of sb-kit into /usr/local whenever it is run from elsewhere
-  # (e.g. deploy.sh staging dir), so the installed `sbctl` never goes stale.
-  local quiet="${1:-0}"
-  [[ "$(id -u)" -eq 0 ]] || return 0
-  [[ "${SCRIPT_DIR}" == "/usr/local/bin" || "${SCRIPT_DIR}" == "${SB_LIB_DST}" ]] && return 0
-  [[ -f "${SCRIPT_DIR}/sbctl.sh" && -d "${SCRIPT_DIR}/lib" ]] || return 0
-  local installed_ver=""
-  [[ -f "${SB_LIB_DST}/VERSION" ]] && installed_ver=$(cat "${SB_LIB_DST}/VERSION" 2>/dev/null || true)
-  mkdir -p "${SB_LIB_DST}"
-  cp -f "${SCRIPT_DIR}"/lib/*.py "${SCRIPT_DIR}"/lib/*.sh "${SB_LIB_DST}/" || die "无法同步 sb-kit 组件"
-  chmod 755 "${SB_LIB_DST}"/*.py "${SB_LIB_DST}"/*.sh 2>/dev/null || true
-  printf '%s\n' "$SBKIT_VERSION" > "${SB_LIB_DST}/VERSION"
-  cp -f "${SCRIPT_DIR}/sbctl.sh" "${SB_CTL_DST}.new"
-  chmod 755 "${SB_CTL_DST}.new"
-  mv -f "${SB_CTL_DST}.new" "${SB_CTL_DST}"
-  if [[ "$quiet" != "1" || "$installed_ver" != "$SBKIT_VERSION" ]]; then
-    ok "管理命令已就绪: ${SB_CTL_DST} (sb-kit ${installed_ver:+${installed_ver} -> }${SBKIT_VERSION})"
+  local quiet="${1:-0}" source="${2:-}" version
+  [[ "$(id -u)" == 0 ]] || return 0
+  if [[ -z "$source" ]]; then
+    is_staging_copy || return 0
+    source="$SCRIPT_DIR"
   fi
+  acquire_lock
+  need_cmd python3
+  version=$(python3 "$LIB_DIR/bundle.py" publish "$source" "$SB_LIB_DST" "$SB_CTL_DST") ||
+    die "同步失败，请检查源码或安装目录"
+  if [[ "$quiet" != 1 ]]; then ok "管理命令已就绪: ${SB_CTL_DST} (sb-kit ${version})"; fi
 }
 
 require_managed_installation() {
@@ -560,8 +565,6 @@ install_tcpfit() {
 }
 
 cmd_tune() {
-  need_root
-  acquire_lock
   local bw="500" rtt="" swap_size="auto" do_rollback=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -578,6 +581,8 @@ cmd_tune() {
     esac
   done
 
+  need_root
+  acquire_lock
   install_tcpfit
   if [[ "$do_rollback" -eq 1 ]]; then
     TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" rollback || die "tcpfit 回滚失败"
@@ -955,6 +960,7 @@ cmd_add() {
     esac
   done
 
+  require_supported_protocol "$proto"
   if [[ "$generate_only" -eq 0 ]]; then
     need_root
     acquire_lock
@@ -1162,16 +1168,11 @@ pick_existing_tag() {
 }
 
 cmd_modify() {
-  need_root
-  acquire_lock
-  local tag="${1:-}"
-  if [[ -z "$tag" || "$tag" == --* ]]; then
-    tag=$(pick_existing_tag)
-  else
+  local tag=""
+  if [[ $# -gt 0 && "$1" != -* ]]; then
+    tag="$1"
     shift
   fi
-
-  [[ -f "${SB_META_DIR}/${tag}.json" ]] || die "找不到节点元数据: ${tag}"
 
   local new_port="" new_sni="" new_remark="" new_wl="" clear_wl=0 rotate=0
   local new_hop="" clear_hop=0 new_masq=""
@@ -1196,6 +1197,10 @@ cmd_modify() {
     esac
   done
 
+  need_root
+  acquire_lock
+  [[ -n "$tag" ]] || tag=$(pick_existing_tag)
+  [[ -f "${SB_META_DIR}/${tag}.json" ]] || die "找不到节点元数据: ${tag}"
   local cur_proto cur_port old_hop old_wl
   IFS='|' read -r cur_proto cur_port old_hop old_wl < <(
     python3 - "${SB_META_DIR}/${tag}.json" <<'PY'
@@ -1330,6 +1335,7 @@ cmd_yaml() {
 }
 
 cmd_del() {
+  [[ $# -le 1 && "${1:-}" != -* ]] || die "用法: sbctl del [tag]"
   need_root
   acquire_lock
   local target="${1:-}"
@@ -1363,31 +1369,30 @@ cmd_del() {
 }
 
 cmd_route() {
-  need_root
-  acquire_lock
+  [[ $# -le 1 ]] || die "用法: sbctl route [status|block-cn-on|block-cn-off]"
   local action="${1:-status}"
   case "$action" in
-    block-cn-on)
-      ensure_base_config 1
-      compgen -G "${SB_CONF_DIR}/*.json" >/dev/null 2>&1 && validate_and_restart
+    block-cn-on|block-cn-off)
+      need_root
+      acquire_lock
+      local enabled=0
+      [[ "$action" == block-cn-on ]] && enabled=1
+      ensure_base_config "$enabled" || return 1
+      if compgen -G "${SB_CONF_DIR}/*.json" >/dev/null; then validate_and_restart; fi
       ;;
-    block-cn-off)
-      ensure_base_config 0
-      compgen -G "${SB_CONF_DIR}/*.json" >/dev/null 2>&1 && validate_and_restart
-      ;;
-    status|*)
+    status)
+      need_root
       if [[ -f "$SB_CONFIG" ]] && grep -q '"geoip-cn"' "$SB_CONFIG"; then
         ok "当前回国 IP 阻断: 已开启（geoip-cn）"
       else
         info "当前回国 IP 阻断: 已关闭"
       fi
       ;;
+    *) die "未知路由操作: $action" ;;
   esac
 }
 
 cmd_install() {
-  need_root
-  acquire_lock
   local sb_ver="latest" proto="vless-reality" port="" sni="" domain="" ip=""
   local block_cn=0 do_tune=1 bw="500" rtt="auto" swap_size="auto"
   local non_interactive=0 skip_cn=0
@@ -1416,6 +1421,17 @@ cmd_install() {
     esac
   done
 
+  require_supported_protocol "$proto"
+  [[ -z "$port" ]] || valid_port "$port" || die "无效端口: $port"
+  case "$proto" in
+    hy2|hysteria2|naive|anytls)
+      if [[ -z "$domain" && ( "$non_interactive" -eq 1 || ! -t 0 ) ]]; then
+        die "该协议的非交互安装需要 --domain"
+      fi
+      ;;
+  esac
+  need_root
+  acquire_lock
   ensure_base_deps
   backup_existing_singbox
   install_self
@@ -1519,6 +1535,7 @@ cmd_regen() (
 )
 
 cmd_update() {
+  [[ $# -le 1 && "${1:-}" != -* ]] || die "用法: sbctl update [版本]"
   need_root
   acquire_lock
   local target_ver="${1:-latest}"
@@ -1542,10 +1559,18 @@ cmd_version() {
 }
 
 cmd_sync() {
+  local source
+  if [[ $# == 2 && "$1" == --source ]]; then
+    source="$2"
+  elif [[ $# == 0 ]]; then
+    if is_staging_copy; then source="$SCRIPT_DIR"; else source="$PWD"; fi
+  else
+    die "用法: sbctl sync [--source 仓库目录]"
+  fi
+  [[ -n "$source" ]] || die "请指定 sb-kit 源码目录"
   need_root
-  acquire_lock
-  install_self 0
-  cmd_version
+  install_self 0 "$source"
+  "$SB_CTL_DST" --version
 }
 
 cmd_audit() {
@@ -1554,14 +1579,14 @@ cmd_audit() {
 }
 
 cmd_uninstall() {
-  need_root
-  acquire_lock
-  require_managed_installation
   local keep_tcpfit=0 marker="${SB_DIR}/.managed-by-sb-kit" origin=legacy snapshot="" svc name directory
   if [[ $# -gt 0 ]]; then
     [[ $# -eq 1 && "$1" == "--keep-tcpfit" ]] || die "用法: sbctl uninstall [--keep-tcpfit]"
     keep_tcpfit=1
   fi
+  need_root
+  acquire_lock
+  require_managed_installation
   if [[ -s "$marker" ]]; then
     [[ "$(sed -n '1p' "$marker")" == sb-kit-v1 ]] || die "无法识别托管标记，已中止卸载"
     origin=$(sed -n '2p' "$marker")
@@ -1618,6 +1643,8 @@ cmd_uninstall() {
     info "回滚 tcpfit 调优..."
     TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" rollback || die "tcpfit 回滚失败"
   fi
+  python3 "$LIB_DIR/bundle.py" uninstall "$SB_LIB_DST" "$SB_CTL_DST" ||
+    die "清理托管版本失败，请检查安装目录"
   rm -f "$marker" "$SB_DIR/.sb-kit-tcpfit-tuned" "$SB_CTL_DST" || die "移除 sb-kit 管理文件失败"
   for name in audit.sh config_gen.py sni_probe.py managed_files.py VERSION; do
     rm -f "$SB_LIB_DST/$name" || die "移除 sb-kit 组件 $name 失败"
@@ -1652,7 +1679,7 @@ sbctl (sb-kit ${SBKIT_VERSION}) — 纯 sing-box + tcpfit 精简管理工具（�
   sbctl audit                       一键只读安全巡检
   sbctl update [ver]                仅升级 sing-box 核心（SHA-256 校验，失败自动回滚）
   sbctl regen                       按当前 sing-box 版本语法从 meta 重建全部入站配置
-  sbctl sync                        同步当前目录的 sbctl 与 lib 到 /usr/local
+  sbctl sync [--source DIR]         从当前仓库或指定源码目录同步 sbctl 与 lib 到 /usr/local
   sbctl --version                   查看 sb-kit 与 sing-box 版本
   sbctl uninstall [--keep-tcpfit]   彻底卸载
 
@@ -1660,6 +1687,22 @@ sbctl (sb-kit ${SBKIT_VERSION}) — 纯 sing-box + tcpfit 精简管理工具（�
   SB_CF_TOKEN                       Cloudflare DNS-01 API Token（避免出现在命令行中）
 EOF
 }
+
+menu_command() {
+  # Start a separate invocation so die(), errexit and the write lock belong to one action.
+  bash "${BASH_SOURCE[0]}" "$@" || warn "命令执行失败，已返回菜单。"
+}
+
+menu_system_action() (
+  need_root
+  acquire_lock
+  case "$1" in
+    tcpfit) install_tcpfit && TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" ;;
+    start) systemctl start sing-box && ok "已启动" ;;
+    stop) systemctl stop sing-box && ok "已停止" ;;
+    restart) validate_and_restart ;;
+  esac
+)
 
 interactive_menu() {
   while true; do
@@ -1726,47 +1769,46 @@ interactive_menu() {
         fi
         read -rp "是否开启回国 IP 阻断 (geoip:cn)? [y/N]: " block_cn
         [[ "${block_cn:-n}" =~ ^[Yy]$ ]] && args+=(--block-cn)
-        cmd_install "${args[@]}" || true
+        menu_command install "${args[@]}"
         ;;
       2)
         printf '  1) vless-reality  2) hy2  3) naive  4) anytls  5) ss2022  6) socks\n'
         local p=""
         read -rp "请选择协议 [1-6]: " p
         case "$p" in
-          1) cmd_add vless-reality || true ;;
-          2) cmd_add hy2 || true ;;
-          3) cmd_add naive || true ;;
-          4) cmd_add anytls || true ;;
-          5) cmd_add ss2022 || true ;;
-          6) cmd_add socks || true ;;
+          1) menu_command add vless-reality ;;
+          2) menu_command add hy2 ;;
+          3) menu_command add naive ;;
+          4) menu_command add anytls ;;
+          5) menu_command add ss2022 ;;
+          6) menu_command add socks ;;
           *) warn "无效选择" ;;
         esac
         ;;
-      3) cmd_modify || true ;;
+      3) menu_command modify ;;
       4)
         cmd_links
         local show_y=""
         read -rp "是否顺便打印 Clash/Mihomo YAML 片段? [y/N]: " show_y
         [[ "${show_y:-n}" =~ ^[Yy]$ ]] && cmd_yaml
         ;;
-      5) cmd_del || true ;;
+      5) menu_command del ;;
       6)
         printf '  1) 自动调优（按地区推 RTT）  2) 自定义带宽/RTT  3) 打开 tcpfit 原生菜单(可扫拐点)  4) 一键回滚\n'
         local ta=""
         read -rp "请选择 [1-4]: " ta
         case "$ta" in
-          1) cmd_tune --bw 500 --rtt auto || true ;;
+          1) menu_command tune --bw 500 --rtt auto ;;
           2)
             local bw="" rtt=""
             read -rp "套餐带宽 Mbps [500]: " bw
             read -rp "参考 RTT ms [auto]: " rtt
-            cmd_tune --bw "${bw:-500}" --rtt "${rtt:-auto}" || true
+            menu_command tune --bw "${bw:-500}" --rtt "${rtt:-auto}"
             ;;
           3)
-            install_tcpfit
-            TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" || true
+            menu_system_action tcpfit || warn "tcpfit 执行失败"
             ;;
-          4) cmd_tune --rollback || true ;;
+          4) menu_command tune --rollback ;;
           *) warn "无效选择" ;;
         esac
         ;;
@@ -1774,17 +1816,17 @@ interactive_menu() {
         cmd_route status
         local ra=""
         read -rp "1=开启回国阻断  2=关闭回国阻断 [回车取消]: " ra
-        [[ "$ra" == "1" ]] && cmd_route block-cn-on
-        [[ "$ra" == "2" ]] && cmd_route block-cn-off
+        [[ "$ra" == "1" ]] && menu_command route block-cn-on
+        [[ "$ra" == "2" ]] && menu_command route block-cn-off
         ;;
       8)
         printf '  1) 启动  2) 停止  3) 重启  4) 查看最近 30 行错误日志\n'
         local sa=""
         read -rp "请选择 [1-4]: " sa
         case "$sa" in
-          1) systemctl start sing-box && ok "已启动" ;;
-          2) systemctl stop sing-box && ok "已停止" ;;
-          3) validate_and_restart || true ;;
+          1) menu_system_action start || warn "启动失败" ;;
+          2) menu_system_action stop || warn "停止失败" ;;
+          3) menu_system_action restart || warn "重启失败" ;;
           4) [[ -f "${SB_LOG_DIR}/error.log" ]] && tail -n 30 "${SB_LOG_DIR}/error.log" || info "暂无错误日志" ;;
           *) warn "无效选择" ;;
         esac
@@ -1795,8 +1837,8 @@ interactive_menu() {
         local ua=""
         read -rp "请选择 [1-2]: " ua
         case "$ua" in
-          1) cmd_update || true ;;
-          2) cmd_regen || true ;;
+          1) menu_command update ;;
+          2) menu_command regen ;;
           *) warn "无效选择" ;;
         esac
         ;;
@@ -1814,10 +1856,15 @@ interactive_menu() {
   done
 }
 
-main() {
+main() (
+  set -e
+  CLEANUP_PATHS=()
+  trap cleanup_paths EXIT
   if [[ $# -eq 0 ]]; then
     if [[ -t 0 ]]; then
-      install_self 1
+      if is_staging_copy; then
+        ( install_self 1 ) || return 1
+      fi
       interactive_menu
     else
       show_help
@@ -1827,41 +1874,45 @@ main() {
 
   local sub="$1"
   shift
-  case "$sub" in
-    -h|--help|help)       show_help; return 0 ;;
-    -v|--version|version) cmd_version; return 0 ;;
-    sync)                 cmd_sync; return 0 ;;
-    uninstall)            cmd_uninstall "$@"; return 0 ;;
-  esac
-
-  # Auto-sync /usr/local/bin/sbctl when invoked as root from a staging copy,
-  # but keep read-only commands and --generate-only dry-runs side-effect free.
-  local skip_sync=0 arg
-  case "$sub" in
-    links|link|url|yaml|clash|audit|check) skip_sync=1 ;;
-    add)
-      for arg in "$@"; do
-        [[ "$arg" == "--generate-only" ]] && { skip_sync=1; break; }
-      done
-      ;;
-  esac
-  [[ "$skip_sync" -eq 0 ]] && install_self 1
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    case "$sub" in
+      add) cmd_add vless-reality "$1"; return ;;
+      route|del|rm|sync|regen|update|up|uninstall|audit|check|links|link|url|yaml|clash)
+        show_help; return ;;
+    esac
+  fi
 
   case "$sub" in
-    install)           cmd_install "$@" ;;
+    -h|--help|help)    show_help; return ;;
+    -v|--version|version) cmd_version; return ;;
+    sync)              cmd_sync "$@"; return ;;
+    uninstall)         cmd_uninstall "$@"; return ;;
+    install)           cmd_install "$@"; return ;;
     add)               cmd_add "$@" ;;
     modify|mod|edit)   cmd_modify "$@" ;;
-    links|link|url)    cmd_links "$@" ;;
-    yaml|clash)        cmd_yaml "$@" ;;
+    links|link|url)    [[ $# -le 1 ]] || die "用法: sbctl links [meta-dir]"; cmd_links "$@"; return ;;
+    yaml|clash)        [[ $# -le 1 ]] || die "用法: sbctl yaml [meta-dir]"; cmd_yaml "$@"; return ;;
     del|rm)            cmd_del "$@" ;;
     tune|bbr)          cmd_tune "$@" ;;
     route)             cmd_route "$@" ;;
-    audit|check)       cmd_audit "$@" ;;
+    audit|check)       [[ $# -eq 0 ]] || die "用法: sbctl audit"; cmd_audit; return ;;
     update|up)         cmd_update "$@" ;;
-    regen)             cmd_regen "$@" ;;
+    regen)
+      [[ $# -eq 0 ]] || die "用法: sbctl regen"
+      need_root
+      acquire_lock
+      cmd_regen
+      ;;
     *) die "未知子命令: ${sub}（运行 sbctl --help 查看用法）" ;;
   esac
-}
+  local result=$?
+  [[ "$result" -eq 0 ]] || return "$result"
+  # Parsers acquire the write lock only for real changes. This also distinguishes
+  # a dry run or help flag from a literal option value with the same spelling.
+  if [[ "$SB_LOCK_HELD" == 1 ]] && is_staging_copy; then
+    ( install_self 1 ) || die "业务操作已完成，但 sbctl 同步失败。请重新运行 sbctl.sh sync。"
+  fi
+)
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"

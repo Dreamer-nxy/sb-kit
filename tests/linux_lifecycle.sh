@@ -40,6 +40,27 @@ fixtures=$(mktemp -d)
 trap 'rm -rf "$fixtures"' EXIT
 cp "$core" "$fixtures/native-core"
 
+echo "== Sync a new CLI and helper from the checkout while sing-box is serving"
+original_version=$("$ctl" --version)
+invocation=$(systemctl show "$service" -p InvocationID --value)
+node_hash=$(sha256sum "$config/conf/socks-39182.json" "$config/meta/socks-39182.json")
+checkout="$fixtures/checkout"
+mkdir "$checkout"
+cp -R "$repo/lib" "$checkout/lib"
+sed -E 's/^SBKIT_VERSION="[^"]+"$/SBKIT_VERSION="91.0.2"/' "$repo/sbctl.sh" >"$checkout/sbctl.sh"
+printf '#!/usr/bin/env bash\necho synced-helper-91.0.2\n' >"$checkout/lib/audit.sh"
+bash "$checkout/sbctl.sh" route status >/dev/null
+bash "$checkout/sbctl.sh" add socks --help >/dev/null
+if bash "$checkout/sbctl.sh" misspelled-command >/dev/null 2>&1; then fail "accepted an unknown command"; fi
+[[ $("$ctl" --version) == "$original_version" ]] || fail "a read-only or invalid staged command published the candidate"
+(cd "$checkout" && "$ctl" sync)
+[[ $("$ctl" --version) == "sb-kit 91.0.2 (sing-box: $version)" ]] || fail "sync did not publish the new CLI"
+[[ $("$ctl" audit) == synced-helper-91.0.2 ]] || fail "sync did not publish the matching helper"
+(cd "$fixtures" && bash "$repo/sbctl.sh" sync)
+[[ $("$ctl" --version) == "$original_version" ]] || fail "staged sync did not restore the repository version"
+[[ $(systemctl show "$service" -p InvocationID --value) == "$invocation" ]] && listening 39182 || fail "sync interrupted the service"
+[[ $(sha256sum "$config/conf/socks-39182.json" "$config/meta/socks-39182.json") == "$node_hash" ]] || fail "sync changed the node"
+
 echo "== Reject a firewall unit failure and retain the original service"
 mkdir -p "$dropin"
 printf '[Service]\nExecStartPre=/bin/false\n' >"$dropin/fail-start.conf"
@@ -130,6 +151,7 @@ if listening 39182 || systemctl is-active --quiet "$service"; then fail "service
 [[ $(systemctl show "$service" -p LoadState --value) == not-found ]] || fail "unit survived uninstall"
 if nft list table inet sbkit_wl_socks_39182 >/dev/null 2>&1; then fail "uninstall left a kernel filter"; fi
 [[ ! -e "$ctl" && ! -e "$core" && ! -e "$config/config.json" && ! -e "$config/.managed-by-sb-kit" ]] || fail "managed installation remained"
+[[ ! -e /usr/local/lib/sb-kit && ! -L "$ctl" ]] || fail "synced toolkit remained after uninstall"
 [[ $(cat "$config/operator-note.txt") == preserve ]] || fail "operator file lost"
 [[ ! -e "$old_cert" ]] || fail "managed certificate survived uninstall"
 if bash "$repo/sbctl.sh" uninstall --keep-tcpfit >/dev/null; then fail "unmanaged uninstall accepted"; fi

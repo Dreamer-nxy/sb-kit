@@ -37,23 +37,68 @@ if [[ "$TARGET" == *:* ]]; then
   TARGET="${TARGET%:*}"
 fi
 
-REMOTE_STAGE="/tmp/sb-kit-stage"
+REMOTE_STAGE=""
+valid_stage() {
+  [[ "$REMOTE_STAGE" =~ ^/tmp/sb-kit-stage\.[a-zA-Z0-9]{10}$ ]]
+}
+
+cleanup_stage() {
+  local rc=$?
+  trap - EXIT
+  if valid_stage; then
+    if ! ssh -n -o ConnectTimeout=5 -p "$SSH_PORT" -- "$TARGET" "rm -rf -- '$REMOTE_STAGE'"; then
+      printf '[!] 无法确认远端临时目录已清理: %s\n' "$REMOTE_STAGE" >&2
+      [[ "$rc" -ne 0 ]] || rc=1
+    fi
+  fi
+  exit "$rc"
+}
+trap cleanup_stage EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "[*] 正在推送 sb-kit 到 ${TARGET}:${SSH_PORT}（不留任何 GitHub Token）..."
-COPYFILE_DISABLE=1 tar --exclude='__pycache__' -C "$SCRIPT_DIR" -czf - sbctl.sh lib | \
-  ssh -p "$SSH_PORT" "$TARGET" "rm -rf '${REMOTE_STAGE}' && mkdir -p '${REMOTE_STAGE}' && tar -xzf - -C '${REMOTE_STAGE}' && chmod +x '${REMOTE_STAGE}/sbctl.sh' '${REMOTE_STAGE}/lib/'*.sh '${REMOTE_STAGE}/lib/'*.py"
+REMOTE_STAGE=$(ssh -n -p "$SSH_PORT" -- "$TARGET" 'umask 077 && mktemp -d /tmp/sb-kit-stage.XXXXXXXXXX')
+valid_stage || { echo '[x] 远端未返回预期的临时目录路径' >&2; exit 1; }
+upload_command="cd '$REMOTE_STAGE' && tar -xzf - && chmod +x sbctl.sh lib/*.sh lib/*.py ||
+  { rc=\$?; rm -rf -- '$REMOTE_STAGE'; exit \"\$rc\"; }"
+COPYFILE_DISABLE=1 tar --no-xattrs --exclude='__pycache__' -C "$SCRIPT_DIR" -czf - sbctl.sh lib | \
+  ssh -p "$SSH_PORT" -- "$TARGET" "$upload_command"
 
+ssh_args=(-p "$SSH_PORT")
 if [[ "${1:-}" == "sync" ]]; then
   echo "[+] 同步远端 /usr/local/bin/sbctl 与 /usr/local/lib/sb-kit..."
-  ssh -p "$SSH_PORT" "$TARGET" "bash '${REMOTE_STAGE}/sbctl.sh' sync; rc=\$?; rm -rf '${REMOTE_STAGE}'; exit \$rc"
-  exit 0
+elif [[ $# -eq 0 ]]; then
+  echo "[+] 推送完成，进入远端 sbctl 可视化菜单..."
+  ssh_args+=(-t)
+else
+  echo "[+] 推送完成，执行远端 sbctl..."
+  ssh_args+=(-t)
 fi
 
-if [[ $# -eq 0 ]]; then
-  echo "[+] 推送完成，进入远端 sbctl 可视化菜单..."
-  ssh -t -p "$SSH_PORT" "$TARGET" "bash '${REMOTE_STAGE}/sbctl.sh'; rm -rf '${REMOTE_STAGE}'"
-else
-  printf -v ESCAPED_ARGS ' %q' "$@"
-  echo "[+] 推送完成，执行: sbctl${ESCAPED_ARGS}"
-  ssh -t -p "$SSH_PORT" "$TARGET" "bash '${REMOTE_STAGE}/sbctl.sh'${ESCAPED_ARGS}; rc=\$?; rm -rf '${REMOTE_STAGE}'; exit \$rc"
-fi
+# SSH passes the command through the user's login shell, which can be /bin/sh.
+remote_command="bash '$REMOTE_STAGE/sbctl.sh'"
+for arg in "$@"; do
+  quoted=${arg//\'/\'\\\'\'}
+  remote_command+=" '$quoted'"
+done
+# The remote shell owns normal cleanup, including a failed command or an SSH hangup.
+# The local trap covers upload failures and retries cleanup after a lost connection.
+remote_cleanup='
+clean_exit() {
+  rc=$?
+  trap - 0
+  if ! rm -rf -- "$stage" && [ "$rc" -eq 0 ]; then rc=1; fi
+  exit "$rc"
+}
+trap clean_exit 0
+'
+remote_command="stage='$REMOTE_STAGE'
+$remote_cleanup
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+$remote_command"
+ssh "${ssh_args[@]}" -- "$TARGET" "$remote_command"
+REMOTE_STAGE=""
