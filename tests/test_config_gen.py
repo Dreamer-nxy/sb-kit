@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_GEN = ROOT / "lib" / "config_gen.py"
@@ -44,6 +48,10 @@ class TestSbKitConfigGen(unittest.TestCase):
         self.conf_dir.mkdir()
         self.meta_dir.mkdir()
         self.state_dir.mkdir()
+        self.dirs = [
+            "--conf-dir", str(self.conf_dir), "--meta-dir", str(self.meta_dir),
+            "--state-dir", str(self.state_dir),
+        ]
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -159,6 +167,7 @@ class TestSbKitConfigGen(unittest.TestCase):
         )
         self.assertIn("pinSHA256=", r1.stdout)
         m1 = json.loads((self.meta_dir / "hy2-8445.json").read_text(encoding="utf-8"))
+        self.assertTrue((Path(m1["self_cert"]).parent / ".managed-by-sb-kit").is_file())
 
         # Port change alone must REUSE the existing cert & keep pinSHA256 identical.
         run_gen(
@@ -167,8 +176,9 @@ class TestSbKitConfigGen(unittest.TestCase):
         )
         m2 = json.loads((self.meta_dir / "hy2-8449.json").read_text(encoding="utf-8"))
         self.assertEqual(m2["pin_sha256"], m1["pin_sha256"])
-        self.assertEqual(m2["cert"], m1["cert"])
-        self.assertEqual(m2["key"], m1["key"])
+        self.assertEqual(m2["self_cert"], m1["self_cert"])
+        self.assertEqual(m2["self_key"], m1["self_key"])
+        old_key = Path(m2["self_key"]).read_bytes()
 
         # Explicit --rotate-creds re-issues cert & changes pinSHA256.
         run_gen(
@@ -177,6 +187,56 @@ class TestSbKitConfigGen(unittest.TestCase):
         )
         m3 = json.loads((self.meta_dir / "hy2-8449.json").read_text(encoding="utf-8"))
         self.assertNotEqual(m3["pin_sha256"], m1["pin_sha256"])
+        self.assertNotEqual(m3["self_cert"], m2["self_cert"])
+        # A failed restart may restore the previous metadata and inbound.
+        old_der = ssl.PEM_cert_to_DER_cert(Path(m2["self_cert"]).read_text())
+        self.assertEqual(hashlib.sha256(old_der).hexdigest(), m2["pin_sha256"].replace(":", "").lower())
+        self.assertEqual(Path(m2["self_key"]).read_bytes(), old_key)
+
+    def test_legacy_self_signed_port_reuse_and_rejected_edits(self) -> None:
+        def add(port: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+            return run_gen("add", "--proto", "hy2", "--port", port, "--ip", "192.0.2.1",
+                           "--self-signed", *self.dirs, check=check)
+
+        add("8445")
+        # Early versions named certificate files after the tag and did not store their paths in meta.
+        old_tag = "hy2-8445"
+        path = self.meta_dir / f"{old_tag}.json"
+        old = json.loads(path.read_text())
+        tls = json.loads((self.conf_dir / path.name).read_text())
+        for field, key, suffix in (("self_cert", "certificate_path", ".crt"), ("self_key", "key_path", ".key")):
+            legacy = self.state_dir / "certs" / (old_tag + suffix)
+            Path(old.pop(field)).rename(legacy)
+            tls["inbounds"][0]["tls"][key] = str(legacy)
+        path.write_text(json.dumps(old))
+        (self.conf_dir / path.name).write_text(json.dumps(tls))
+
+        run_gen("modify", "--tag", old_tag, "--port", "8449", *self.dirs)
+        add("8445")
+        moved = json.loads((self.meta_dir / "hy2-8449.json").read_text())
+        replacement = json.loads(path.read_text())
+        self.assertNotEqual(replacement["self_cert"], moved["self_cert"])
+        der = ssl.PEM_cert_to_DER_cert(Path(moved["self_cert"]).read_text())
+        self.assertEqual(hashlib.sha256(der).hexdigest(), old["pin_sha256"].replace(":", "").lower())
+
+        before = {p: p.read_bytes() for p in self.state_dir.rglob("*") if p.is_file()}
+        self.assertNotEqual(add("8445", check=False).returncode, 0)
+        clashing = run_gen("modify", "--tag", "hy2-8449", "--port", "8445",
+                           "--rotate-creds", *self.dirs, check=False)
+        self.assertNotEqual(clashing.returncode, 0)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.state_dir.rglob("*") if p.is_file()})
+
+        legacy_cert = Path(moved["self_cert"])
+        legacy_cert.write_bytes(Path(replacement["self_cert"]).read_bytes())
+        mismatched = run_gen("regen", *self.dirs, check=False)
+        self.assertNotEqual(mismatched.returncode, 0)
+        self.assertIn("fingerprint mismatch", mismatched.stderr)
+        legacy_cert.write_bytes(before[legacy_cert])
+        Path(moved["self_key"]).unlink()
+        broken = run_gen("regen", *self.dirs, check=False)
+        self.assertNotEqual(broken.returncode, 0)
+        self.assertIn("self-signed certificate or key missing", broken.stderr)
+        self.assertFalse(Path(moved["self_key"]).exists())
 
     def test_regen_upgrades_113_acme_to_114_certificate_provider(self) -> None:
         run_gen(
@@ -207,6 +267,46 @@ class TestSbKitConfigGen(unittest.TestCase):
         bad = run_gen("normalize-ips", "1.2.3.4; rm -rf /", check=False)
         self.assertNotEqual(bad.returncode, 0)
 
+    def test_regen_invalid_late_metadata_keeps_entire_batch(self) -> None:
+        run_gen("add", "--proto", "hy2", "--port", "8444", "--domain", "hy.example.com",
+                "--sb-ver", "1.13.14", "--ip", "192.0.2.1", *self.dirs)
+        run_gen("add", "--proto", "socks", "--port", "30001", "--ip", "192.0.2.1", *self.dirs)
+        path = self.meta_dir / "socks-30001.json"
+        old = json.loads(path.read_text())
+        missing_password = dict(old)
+        del missing_password["password"]
+        for bad in ("{", "[]", json.dumps(missing_password), json.dumps(dict(old, tag="socks-30002"))):
+            with self.subTest(metadata=bad[:2]):
+                path.write_text(bad)
+                snapshots = {p: p.read_bytes() for p in Path(self.tmp.name).rglob("*.json")}
+                result = run_gen("regen", "--sb-ver", "1.14.4", *self.dirs, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(path.name, result.stderr)
+                self.assertNotIn("REGEN=", result.stdout)
+                self.assertEqual(snapshots, {p: p.read_bytes() for p in Path(self.tmp.name).rglob("*.json")})
+
+    def test_batch_publish_io_failure_restores_originals(self) -> None:
+        existing = self.conf_dir / "a.json"
+        new = self.conf_dir / "b.json"
+        failing = self.meta_dir / "b.json"
+        existing.write_bytes(b"original\n")
+        original_inode = existing.stat().st_ino
+        replace = os.replace
+
+        def fail_on_last_commit(source: Path, dest: Path) -> None:
+            if dest == failing:
+                raise OSError("simulated commit failure")
+            replace(source, dest)
+
+        files = [(existing, {}, 0o640), (new, {}, 0o640), (failing, {}, 0o600)]
+        with mock.patch.object(config_gen.os, "replace", side_effect=fail_on_last_commit):
+            with self.assertRaisesRegex(OSError, "simulated commit failure"):
+                config_gen.publish_node_files(files)
+        self.assertEqual(existing.read_bytes(), b"original\n")
+        self.assertEqual(existing.stat().st_ino, original_inode)
+        self.assertEqual(list(self.conf_dir.iterdir()), [existing])
+        self.assertEqual(list(self.meta_dir.iterdir()), [])
+
     def test_naive_anytls_ss2022_sip002_socks_and_yaml_escaping(self) -> None:
         r_naive = run_gen(
             "add", "--proto", "naive", "--port", "9443", "--ip", "1.2.3.4",
@@ -227,8 +327,14 @@ class TestSbKitConfigGen(unittest.TestCase):
             "--country", "US", "--whitelist", "9.9.9.9,2001:db8::1",
             "--conf-dir", str(self.conf_dir), "--meta-dir", str(self.meta_dir), "--state-dir", str(self.state_dir),
         )
-        # SIP002 percent-encoded userinfo for SS-2022 (not base64)
-        self.assertIn("URI=ss://2022-blake3-aes-256-gcm%3A", r_ss.stdout)
+        uri = next(line[4:] for line in r_ss.stdout.splitlines() if line.startswith("URI="))
+        parsed = urllib.parse.urlsplit(uri)
+        ss_meta = json.loads((self.meta_dir / "ss2022-38001.json").read_text())
+        self.assertEqual(parsed.username, ss_meta["method"])
+        self.assertEqual(urllib.parse.unquote(parsed.password), ss_meta["password"])
+        ss_meta["password"] = "+/8="
+        special_uri, _ = config_gen.format_uri(ss_meta)
+        self.assertEqual(urllib.parse.urlsplit(special_uri).password, "%2B%2F8%3D")
 
         r_socks = run_gen(
             "add", "--proto", "socks", "--port", "38002", "--ip", "1.2.3.4",

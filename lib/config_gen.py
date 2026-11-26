@@ -16,16 +16,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import ssl
 import string
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -78,6 +82,39 @@ def atomic_write_json(path: Path, data: Dict[str, Any], mode: int = 0o640) -> No
         except FileNotFoundError:
             pass
         raise
+
+
+def publish_node_files(files: List[Tuple[Path, Dict[str, Any], int]]) -> None:
+    """Stage the whole batch; retain the original inodes until every rename succeeds."""
+    with ExitStack() as cleanup:
+        staging: Dict[Path, Path] = {}
+        pending = []
+        for target, data, mode in files:
+            parent = target.parent
+            if parent not in staging:
+                parent.mkdir(parents=True, exist_ok=True)
+                work = cleanup.enter_context(tempfile.TemporaryDirectory(dir=parent))
+                staging[parent] = Path(work)
+            staged = staging[parent] / target.name
+            atomic_write_json(staged, data, mode)
+            original = None
+            if target.exists():
+                original = staged.with_suffix(".old")
+                os.link(target, original)
+            pending.append((target, staged, original))
+
+        installed = []
+        try:
+            for target, staged, original in pending:
+                os.replace(staged, target)
+                installed.append((target, original))
+        except BaseException:
+            for target, original in reversed(installed):
+                if original is None:
+                    target.unlink()
+                else:
+                    os.replace(original, target)
+            raise
 
 
 _X25519_P = 2 ** 255 - 19
@@ -165,11 +202,23 @@ def normalize_ip_list(raw: str) -> Tuple[List[str], List[str]]:
     return v4, v6
 
 
-def generate_self_signed_cert(state_dir: Path, tag: str) -> Tuple[str, str, str]:
+def generate_self_signed_cert(state_dir: Path) -> Tuple[str, str, str]:
     cert_dir = state_dir / "certs"
     cert_dir.mkdir(parents=True, exist_ok=True)
-    cert_path = cert_dir / f"{tag}.crt"
-    key_path = cert_dir / f"{tag}.key"
+    # A published identity is immutable. Port reuse and failed rotations cannot
+    # overwrite material still referenced by another node or by a rollback.
+    identity = Path(tempfile.mkdtemp(prefix="identity-", dir=cert_dir))
+    try:
+        (identity / ".managed-by-sb-kit").touch(mode=0o600)
+        return write_self_signed_cert(identity)
+    except BaseException:
+        shutil.rmtree(identity)
+        raise
+
+
+def write_self_signed_cert(identity: Path) -> Tuple[str, str, str]:
+    cert_path = identity / "certificate.crt"
+    key_path = identity / "private.key"
     # Randomized CN/O and non-fixed validity to avoid well-known script fingerprints.
     rand_cn = f"{secrets.token_hex(4)}.local"
     days = str(365 + secrets.randbelow(700))
@@ -207,7 +256,6 @@ def generate_self_signed_cert(state_dir: Path, tag: str) -> Tuple[str, str, str]
 def build_tls_object(
     sb_ver: str,
     state_dir: Path,
-    tag: str,
     domain: str = "",
     cert: str = "",
     key: str = "",
@@ -231,12 +279,18 @@ def build_tls_object(
         return tls, extra_meta
 
     if self_signed or not domain:
-        if reuse_self_signed and all(reuse_self_signed[:2]) and \
-                os.path.isfile(reuse_self_signed[0]) and os.path.isfile(reuse_self_signed[1]):
-            # Keep the existing cert so pinSHA256 stays stable across modify.
+        if reuse_self_signed:
             cert_path, key_path, pin = reuse_self_signed
+            if not Path(cert_path).is_file() or not Path(key_path).is_file():
+                raise ValueError("self-signed certificate or key missing; restore the files or explicitly rotate credentials")
+            pem = Path(cert_path).read_text(encoding="ascii")
+            # Legacy previews on hosts without OpenSSL used a placeholder pair.
+            if pem.strip() != "DRY_RUN_CERT" or pin != "00" * 32:
+                digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+                if digest != pin.replace(":", "").lower():
+                    raise ValueError("stored certificate fingerprint mismatch; restore the certificate or explicitly rotate credentials")
         else:
-            cert_path, key_path, pin = generate_self_signed_cert(state_dir, tag)
+            cert_path, key_path, pin = generate_self_signed_cert(state_dir)
         tls["certificate_path"] = cert_path
         tls["key_path"] = key_path
         extra_meta["tls_mode"] = "self-signed"
@@ -374,8 +428,9 @@ def format_uri(meta: Dict[str, Any]) -> Tuple[str, List[str]]:
     if proto == "ss2022":
         host = format_host_for_uri(ip)
         # SIP002: AEAD-2022 userinfo must be percent-encoded plain text, not base64.
-        userinfo = urllib.parse.quote(f"{meta['method']}:{meta['password']}", safe="")
-        return f"ss://{userinfo}@{host}:{port}#{remark}", extras
+        method = urllib.parse.quote(meta["method"], safe="")
+        password = urllib.parse.quote(meta["password"], safe="")
+        return f"ss://{method}:{password}@{host}:{port}#{remark}", extras
 
     if proto == "socks":
         host = format_host_for_uri(ip)
@@ -500,7 +555,6 @@ def build_inbound_and_meta(
         tls, tls_meta = build_tls_object(
             sb_ver=sb_ver,
             state_dir=state_dir,
-            tag=tag,
             domain=domain,
             cert=cert,
             key=key,
@@ -548,7 +602,6 @@ def build_inbound_and_meta(
         tls, tls_meta = build_tls_object(
             sb_ver=sb_ver,
             state_dir=state_dir,
-            tag=tag,
             domain=domain,
             cert=cert,
             key=key,
@@ -585,7 +638,6 @@ def build_inbound_and_meta(
         tls, tls_meta = build_tls_object(
             sb_ver=sb_ver,
             state_dir=state_dir,
-            tag=tag,
             domain=domain,
             cert=cert,
             key=key,
@@ -663,6 +715,12 @@ def build_inbound_and_meta(
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    name = f"{args.proto}-{args.port}.json"
+    conf_path = Path(args.conf_dir) / name
+    meta_path = Path(args.meta_dir) / name
+    if not args.force and (conf_path.exists() or meta_path.exists()):
+        print(f"ERROR: node {conf_path.stem} already exists (use modify, or del first)", file=sys.stderr)
+        return 1
     try:
         tag, conf_obj, meta = build_inbound_and_meta(
             proto=args.proto,
@@ -687,13 +745,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    conf_path = Path(args.conf_dir) / f"{tag}.json"
-    meta_path = Path(args.meta_dir) / f"{tag}.json"
-    if (conf_path.exists() or meta_path.exists()) and not args.force:
-        print(f"ERROR: node {tag} already exists (use modify, or del first)", file=sys.stderr)
-        return 1
-    atomic_write_json(conf_path, conf_obj, mode=0o640)
-    atomic_write_json(meta_path, meta, mode=0o600)
+    publish_node_files([(conf_path, conf_obj, 0o640), (meta_path, meta, 0o600)])
 
     uri, extras = format_uri(meta)
     print(f"TAG={tag}")
@@ -745,6 +797,8 @@ def rebuild_from_meta(
         or old_meta.get("cf_token", "")
         or read_conf_cf_token(conf_dir / f"{old_tag}.json")
     )
+    if old_meta.get("tls_mode") == "acme-dns01" and not token:
+        raise ValueError("missing DNS-01 credentials in metadata and existing inbound")
     new_whitelist = (
         "" if clear_whitelist
         else (whitelist if whitelist is not None else old_meta.get("whitelist", ""))
@@ -780,15 +834,54 @@ def rebuild_from_meta(
     )
 
 
+def read_node_meta(path: Path) -> Dict[str, Any]:
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(meta, dict):
+        raise ValueError("expected a metadata object")
+    proto = meta.get("proto")
+    port = meta.get("port")
+    if proto not in PROTO_LABELS or type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("invalid node protocol or port")
+    if path.stem != meta.get("tag") or path.stem != f"{proto}-{port}":
+        raise ValueError("metadata filename, tag and protocol/port disagree")
+
+    required = ["ip"]
+    if proto == "vless-reality":
+        required.extend(["uuid", "private_key", "public_key", "short_id", "sni"])
+    else:
+        required.append("password")
+    if proto in ("naive", "socks"):
+        required.append("username")
+    if proto in ("hy2", "naive", "anytls"):
+        tls_mode = meta.get("tls_mode")
+        if tls_mode == "custom-cert":
+            required.extend(["cert", "key"])
+        elif tls_mode in ("acme", "acme-dns01"):
+            required.append("domain")
+        elif tls_mode == "self-signed":
+            required.append("pin_sha256")
+        else:
+            raise ValueError("missing or unknown TLS mode")
+    for key in required:
+        if not isinstance(meta.get(key), str) or not meta[key]:
+            raise ValueError(f"missing or invalid field {key}")
+    return meta
+
+
 def cmd_modify(args: argparse.Namespace) -> int:
     meta_path = Path(args.meta_dir) / f"{args.tag}.json"
     if not meta_path.is_file():
         print(f"ERROR: metadata not found: {meta_path}", file=sys.stderr)
         return 1
 
-    old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
     conf_dir = Path(args.conf_dir)
     try:
+        old_meta = read_node_meta(meta_path)
+        target_tag = f"{old_meta['proto']}-{args.port or old_meta['port']}"
+        new_conf = conf_dir / f"{target_tag}.json"
+        new_meta_path = meta_path.parent / f"{target_tag}.json"
+        if target_tag != args.tag and (new_conf.exists() or new_meta_path.exists()):
+            raise ValueError(f"target node {target_tag} already exists")
         new_tag, conf_obj, new_meta = rebuild_from_meta(
             old_meta,
             conf_dir=conf_dir,
@@ -807,19 +900,12 @@ def cmd_modify(args: argparse.Namespace) -> int:
             clear_whitelist=args.clear_whitelist,
             rotate_creds=args.rotate_creds,
         )
-    except ValueError as exc:
+    except (KeyError, OSError, TypeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     old_conf = conf_dir / f"{args.tag}.json"
-    new_conf = conf_dir / f"{new_tag}.json"
-    new_meta_path = Path(args.meta_dir) / f"{new_tag}.json"
-    if new_tag != args.tag and (new_conf.exists() or new_meta_path.exists()):
-        print(f"ERROR: target node {new_tag} already exists", file=sys.stderr)
-        return 1
-
-    atomic_write_json(new_conf, conf_obj, mode=0o640)
-    atomic_write_json(new_meta_path, new_meta, mode=0o600)
+    publish_node_files([(new_conf, conf_obj, 0o640), (new_meta_path, new_meta, 0o600)])
     if new_tag != args.tag:
         old_conf.unlink(missing_ok=True)
         meta_path.unlink(missing_ok=True)
@@ -840,22 +926,32 @@ def cmd_modify(args: argparse.Namespace) -> int:
 def cmd_regen(args: argparse.Namespace) -> int:
     """Regenerate every inbound conf from meta (e.g. after a 1.13 -> 1.14 core upgrade)."""
     conf_dir = Path(args.conf_dir)
-    count = 0
-    for meta in load_all_meta(Path(args.meta_dir)):
+    meta_dir = Path(args.meta_dir)
+    if not meta_dir.is_dir():
+        print(f"ERROR: metadata directory not found: {meta_dir}", file=sys.stderr)
+        return 1
+    files = []
+    tags = []
+    for path in sorted(meta_dir.glob("*.json")):
         try:
+            meta = read_node_meta(path)
             tag, conf_obj, new_meta = rebuild_from_meta(
                 meta, conf_dir=conf_dir, state_dir=Path(args.state_dir),
                 sb_ver=args.sb_ver, sb_bin=args.sb_bin,
             )
-        except (KeyError, ValueError) as exc:
-            print(f"ERROR: regen {meta.get('tag', '?')}: {exc}", file=sys.stderr)
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            print(f"ERROR: regen {path.name}: {exc}", file=sys.stderr)
             return 1
-        new_meta["sb_ver"] = args.sb_ver or new_meta.get("sb_ver", "")
-        atomic_write_json(conf_dir / f"{tag}.json", conf_obj, mode=0o640)
-        atomic_write_json(Path(args.meta_dir) / f"{tag}.json", new_meta, mode=0o600)
+        files.extend([(conf_dir / path.name, conf_obj, 0o640), (path, new_meta, 0o600)])
+        tags.append(tag)
+    try:
+        publish_node_files(files)
+    except OSError as exc:
+        print(f"ERROR: publishing regenerated nodes: {exc}", file=sys.stderr)
+        return 1
+    for tag in tags:
         print(f"REGEN={tag}")
-        count += 1
-    print(f"COUNT={count}")
+    print(f"COUNT={len(tags)}")
     return 0
 
 

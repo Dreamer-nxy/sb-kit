@@ -10,7 +10,7 @@
 set -euo pipefail
 umask 022
 
-SBKIT_VERSION="0.2.0"
+SBKIT_VERSION="0.2.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}/lib"
@@ -40,6 +40,7 @@ SB_RULES_DIR="${SB_DIR}/rules"
 SB_LOG_DIR="/var/log/sing-box"
 SB_STATE_DIR="/var/lib/sing-box"
 SB_BACKUP_ROOT="/var/backups/sb-kit"
+PRE_INSTALL_BACKUP=""
 SB_UNIT="/etc/systemd/system/sing-box.service"
 SB_LOGROTATE="/etc/logrotate.d/sing-box"
 SB_CTL_DST="/usr/local/bin/sbctl"
@@ -142,13 +143,14 @@ is_port_busy() {
 }
 
 valid_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 && "$1" -le 65535 ]]
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
 }
 
 pick_free_port() {
   # $4 (optional): the node's own current port — treated as free (modify keeps/reuses it).
   local preferred="$1" proto="${2:-tcp}" non_interactive="${3:-0}" self_port="${4:-}"
   valid_port "$preferred" || die "端口必须是 1-65535 的整数: ${preferred}"
+  preferred=$((10#$preferred))
   if [[ -n "$self_port" && "$preferred" == "$self_port" ]] || ! is_port_busy "$preferred" "$proto"; then
     echo "$preferred"
     return 0
@@ -172,6 +174,7 @@ pick_free_port() {
       warn "端口必须是 1-65535 的整数" >&2
       continue
     fi
+    chosen=$((10#$chosen))
     if is_port_busy "$chosen" "$proto"; then
       warn "端口 ${proto}/${chosen} 仍被占用，请换一个" >&2
       continue
@@ -225,7 +228,7 @@ install_self() {
   local installed_ver=""
   [[ -f "${SB_LIB_DST}/VERSION" ]] && installed_ver=$(cat "${SB_LIB_DST}/VERSION" 2>/dev/null || true)
   mkdir -p "${SB_LIB_DST}"
-  cp -f "${SCRIPT_DIR}/lib/"* "${SB_LIB_DST}/"
+  cp -f "${SCRIPT_DIR}"/lib/*.py "${SCRIPT_DIR}"/lib/*.sh "${SB_LIB_DST}/" || die "无法同步 sb-kit 组件"
   chmod 755 "${SB_LIB_DST}"/*.py "${SB_LIB_DST}"/*.sh 2>/dev/null || true
   printf '%s\n' "$SBKIT_VERSION" > "${SB_LIB_DST}/VERSION"
   cp -f "${SCRIPT_DIR}/sbctl.sh" "${SB_CTL_DST}.new"
@@ -236,23 +239,73 @@ install_self() {
   fi
 }
 
-backup_existing_singbox() {
-  if [[ -f "$SB_CONFIG" || -d "$SB_CONF_DIR" ]] && [[ ! -f "${SB_DIR}/.managed-by-sb-kit" ]]; then
-    local ts bk_dir
-    ts=$(date +"%Y%m%d-%H%M%S")
-    bk_dir="${SB_BACKUP_ROOT}/pre-install-${ts}"
-    mkdir -p "$bk_dir"
-    cp -a "$SB_DIR" "${bk_dir}/etc-sing-box" 2>/dev/null || true
-    [[ -f /lib/systemd/system/sing-box.service ]] && cp -a /lib/systemd/system/sing-box.service "$bk_dir/" || true
-    [[ -f "$SB_UNIT" ]] && cp -a "$SB_UNIT" "$bk_dir/" || true
-    warn "检测到已有旧版 /etc/sing-box 配置，已自动冷备份至: ${bk_dir}"
+require_managed_installation() {
+  local path marker="${SB_DIR}/.managed-by-sb-kit" unit
+  [[ -f "$marker" && ! -L "$marker" ]] || die "缺少 sb-kit 托管标记，请保留原有 sing-box 安装。"
+  for path in "$SB_DIR" "$SB_CONF_DIR" "$SB_META_DIR" "$SB_RULES_DIR" "$SB_LOG_DIR" \
+              "$SB_STATE_DIR" "$SB_STATE_DIR/certs" "$SB_LIB_DST" "$NFT_DIR"; do
+    [[ ! -L "$path" ]] || die "托管路径已改为符号链接，请确认归属: $path"
+  done
+  unit=$(systemctl show -p FragmentPath --value sing-box.service 2>/dev/null || true)
+  [[ -z "$unit" || "$unit" == "$SB_UNIT" ]] || die "当前 sing-box 服务归属于其他安装: $unit"
+  if [[ -e "$SB_UNIT" || -L "$SB_UNIT" ]]; then
+    [[ ! -L "$SB_UNIT" ]] && grep -Fxq 'Description=sing-box service (managed by sb-kit)' "$SB_UNIT" \
+      || die "当前 systemd 服务已被替换，请确认归属: $SB_UNIT"
   fi
+}
+
+backup_existing_singbox() {
+  local unit path bk_dir i
+  if [[ -e "${SB_DIR}/.managed-by-sb-kit" || -L "${SB_DIR}/.managed-by-sb-kit" ]]; then
+    require_managed_installation
+    return 0
+  fi
+  for path in "$SB_DIR" "$SB_CONF_DIR" "$SB_META_DIR" "$SB_RULES_DIR" "$SB_STATE_DIR" \
+              "$SB_STATE_DIR/certs" "$SB_STATE_DIR/acme" "$SB_LOG_DIR" "$SB_LOG_DIR/error.log"; do
+    [[ ! -L "$path" ]] || die "接管路径为符号链接，请先确认原件并迁移为独立路径: $path"
+  done
+  python3 "${LIB_DIR}/managed_files.py" check-takeover "$SB_STATE_DIR/acme" || die "旧 ACME 存储含无法完整备份并还原的路径，已中止接管"
+  unit=$(systemctl show -p FragmentPath --value sing-box.service 2>/dev/null || true)
+  local -a paths=("$SB_DIR" "$SB_STATE_DIR" "$SB_LOG_DIR" "$SB_BIN" "${SB_BIN}.bak" "$SB_UNIT" "${SB_UNIT}.d" "$SB_LOGROTATE")
+  local -a names=(etc-sing-box state logs sing-box previous-core-backup local.service local.service.d logrotate)
+  if [[ -n "$unit" && "$unit" != "$SB_UNIT" ]]; then
+    paths+=("$unit")
+    names+=(vendor.service)
+  fi
+  bk_dir=""
+  for i in "${!paths[@]}"; do
+    path="${paths[$i]}"
+    [[ -e "$path" || -L "$path" ]] || continue
+    if [[ -z "$bk_dir" ]]; then
+      mkdir -p "$SB_BACKUP_ROOT" || die "无法创建备份目录: $SB_BACKUP_ROOT"
+      bk_dir=$(mktemp -d "${SB_BACKUP_ROOT}/pre-install-$(date +%Y%m%d-%H%M%S).XXXXXX") || die "无法创建本次备份"
+    fi
+    cp -a "$path" "${bk_dir}/${names[$i]}" || die "备份失败，已中止安装。部分副本位于: $bk_dir"
+  done
+  if [[ -n "$bk_dir" ]]; then
+    if systemctl is-active --quiet sing-box.service; then touch "$bk_dir/was-active" || die "记录原服务状态失败"; fi
+    if systemctl is-enabled --quiet sing-box.service; then touch "$bk_dir/was-enabled" || die "记录原启用状态失败"; fi
+    touch "$bk_dir/complete" || die "备份未能完成，请检查 $bk_dir"
+    PRE_INSTALL_BACKUP="${bk_dir##*/}"
+    warn "已备份原有 sing-box 至 ${bk_dir}，卸载时将恢复被覆盖的配置和服务。"
+  fi
+}
+
+download_release_file() {
+  local url="$1" path="$2" timeout="$3" attempt
+  for attempt in 1 2 3; do
+    curl -fsSL --connect-timeout 10 --max-time "$timeout" "$url" -o "$path" && return 0
+    if [[ "$attempt" != 3 ]]; then sleep "$attempt"; fi
+  done
+  return 1
 }
 
 install_singbox_binary() {
   local target_ver="${1:-latest}"
-  local arch api_url meta tag asset_name dl_url expected_sha
+  local arch api_url tag asset_name dl_url expected_sha tmpdir tarball
   arch=$(detect_arch)
+  tmpdir=$(mktemp -d) || die "无法创建下载临时目录"
+  CLEANUP_PATHS+=("$tmpdir")
 
   if [[ "$target_ver" == "latest" ]]; then
     api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
@@ -262,13 +315,14 @@ install_singbox_binary() {
   fi
 
   info "查询 SagerNet/sing-box 官方 Release (${target_ver})..."
-  meta=$(curl -fsSL --max-time 15 "$api_url") || die "获取 sing-box Release 元数据失败"
+  download_release_file "$api_url" "$tmpdir/release.json" 15 || die "获取 sing-box Release 元数据失败"
 
   IFS='|' read -r tag asset_name dl_url expected_sha < <(
-    ARCH="$arch" python3 - "$meta" <<'PY'
-import json, os, sys
-arch = os.environ["ARCH"]
-data = json.loads(sys.argv[1])
+    python3 - "$arch" "$tmpdir/release.json" <<'PY'
+import json, sys
+arch = sys.argv[1]
+with open(sys.argv[2], encoding="utf-8") as fh:
+    data = json.load(fh)
 tag = data.get("tag_name", "")
 ver = tag.lstrip("v")
 want = f"sing-box-{ver}-linux-{arch}.tar.gz"
@@ -282,36 +336,36 @@ sys.exit(1)
 PY
   ) || die "在 Release 中未找到适配 linux-${arch} 的资产"
 
-  local tmpdir tarball
-  tmpdir=$(mktemp -d)
-  CLEANUP_PATHS+=("$tmpdir")
+  [[ "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]] || die "Release 未提供有效 SHA-256，已中止安装"
   tarball="${tmpdir}/${asset_name}"
 
   info "下载 sing-box ${tag} (${asset_name})..."
-  curl -fsSL --max-time 120 "$dl_url" -o "$tarball" || die "下载 sing-box 失败"
+  download_release_file "$dl_url" "$tarball" 120 || die "下载 sing-box 失败"
 
-  if [[ -n "$expected_sha" ]]; then
-    local actual_sha
-    actual_sha=$(sha256sum "$tarball" | awk '{print $1}')
-    [[ "$actual_sha" == "$expected_sha" ]] || die "SHA-256 校验失败！期望=${expected_sha} 实际=${actual_sha}"
-    ok "SHA-256 校验通过 (${actual_sha:0:16}...)"
-  else
-    warn "GitHub Release 未返回 digest，跳过 SHA-256 校验"
-  fi
+  local actual_sha
+  actual_sha=$(sha256sum "$tarball" | awk '{print $1}') || die "无法计算下载文件的 SHA-256"
+  [[ "$actual_sha" == "$expected_sha" ]] || die "SHA-256 校验失败！期望=${expected_sha} 实际=${actual_sha}"
+  ok "SHA-256 校验通过 (${actual_sha:0:16}...)"
 
-  tar -xzf "$tarball" -C "$tmpdir"
+  tar -xzf "$tarball" -C "$tmpdir" || die "解压 sing-box 失败"
   local extracted
   extracted=$(find "$tmpdir" -maxdepth 2 -type f -name "sing-box" | head -n 1)
   [[ -n "$extracted" ]] || die "解压后未找到 sing-box 二进制"
 
-  chmod 755 "$extracted"
+  chmod 755 "$extracted" || die "无法设置新核心权限"
   "$extracted" version >/dev/null 2>&1 || die "新下载的 sing-box 二进制无法执行（架构/libc 不匹配？）"
   # Keep the previous binary so update can roll back if the new core rejects the config.
-  [[ -x "$SB_BIN" ]] && cp -f "$SB_BIN" "${SB_BIN}.bak"
-  mv -f "$extracted" "${SB_BIN}.new"
-  mv -f "${SB_BIN}.new" "${SB_BIN}"
+  local staged
+  if [[ -x "$SB_BIN" ]]; then
+    staged=$(mktemp "${SB_BIN}.bak.XXXXXX") || die "无法暂存原核心"
+    CLEANUP_PATHS+=("$staged")
+    cp -pL "$SB_BIN" "$staged" && mv -f "$staged" "${SB_BIN}.bak" || die "备份原核心失败"
+  fi
+  staged=$(mktemp "${SB_BIN}.XXXXXX") || die "无法暂存新核心"
+  CLEANUP_PATHS+=("$staged")
+  mv -f "$extracted" "$staged" && mv -f "$staged" "$SB_BIN" || die "写入新核心失败"
   rm -rf "$tmpdir"
-  ok "已安装 ${SB_BIN} ($(sb_version))"
+  ok "已安装 sing-box ${tag}: ${SB_BIN}"
 }
 
 restore_singbox_binary() {
@@ -330,14 +384,18 @@ ensure_singbox_system() {
   fi
 
   mkdir -p "$SB_DIR" "$SB_CONF_DIR" "$SB_META_DIR" "$SB_RULES_DIR" "$SB_LOG_DIR" "$SB_STATE_DIR"
-  touch "${SB_DIR}/.managed-by-sb-kit"
+  if [[ ! -f "${SB_DIR}/.managed-by-sb-kit" ]]; then
+    printf 'sb-kit-v1\n%s\n' "${PRE_INSTALL_BACKUP:-fresh}" >"${SB_DIR}/.managed-by-sb-kit" || die "无法写入托管标记"
+  fi
   chown root:"$SB_GROUP" "$SB_DIR" "$SB_CONF_DIR" "$SB_RULES_DIR"
   chmod 750 "$SB_DIR" "$SB_CONF_DIR" "$SB_RULES_DIR"
   chown root:root "$SB_META_DIR"
   chmod 700 "$SB_META_DIR"
-  chown -R "$SB_USER":"$SB_GROUP" "$SB_LOG_DIR" "$SB_STATE_DIR"
+  chown -hRP "$SB_USER":"$SB_GROUP" "$SB_LOG_DIR" "$SB_STATE_DIR"
   chmod 750 "$SB_LOG_DIR" "$SB_STATE_DIR"
 
+  if [[ -L "$SB_UNIT" ]]; then rm -f "$SB_UNIT" || die "无法替换旧服务链接"; fi
+  if [[ -L "$SB_LOGROTATE" ]]; then rm -f "$SB_LOGROTATE" || die "无法替换旧日志轮换链接"; fi
   cat >"$SB_UNIT" <<EOF
 [Unit]
 Description=sing-box service (managed by sb-kit)
@@ -401,8 +459,11 @@ ensure_base_config() {
   if [[ "$block_cn" == "1" ]]; then
     cn_srs="${SB_RULES_DIR}/geoip-cn.srs"
     info "下载 geoip-cn.srs 规则集..."
-    curl -fsSL --max-time 30 "$GEOIP_CN_SRS_URL" -o "${cn_srs}.tmp" || die "下载 geoip-cn.srs 失败"
-    mv -f "${cn_srs}.tmp" "$cn_srs"
+    local cn_tmp
+    cn_tmp=$(mktemp "${SB_RULES_DIR}/.geoip-cn.XXXXXX") || die "创建规则临时文件失败"
+    CLEANUP_PATHS+=("$cn_tmp")
+    curl -fsSL --max-time 30 "$GEOIP_CN_SRS_URL" -o "$cn_tmp" || die "下载 geoip-cn.srs 失败"
+    mv -f "$cn_tmp" "$cn_srs" || die "写入 geoip-cn.srs 失败"
     chown root:"$SB_GROUP" "$cn_srs"
     chmod 640 "$cn_srs"
   fi
@@ -423,16 +484,16 @@ fix_runtime_perms() {
   # conf: root:sing-box 0640 (readable by service); meta: root-only 0600 (secrets/tokens);
   # state (certs/acme): owned by sing-box so it can read keys and write ACME data.
   [[ -d "$SB_CONF_DIR" ]] && {
-    chown root:"$SB_GROUP" "$SB_CONF_DIR"/*.json 2>/dev/null || true
-    chmod 640 "$SB_CONF_DIR"/*.json 2>/dev/null || true
+    find "$SB_CONF_DIR" -maxdepth 1 -type f -name '*.json' -exec chown root:"$SB_GROUP" {} + -exec chmod 640 {} +
   }
   [[ -d "$SB_META_DIR" ]] && {
-    chown root:root "$SB_META_DIR"/*.json 2>/dev/null || true
-    chmod 600 "$SB_META_DIR"/*.json 2>/dev/null || true
+    find "$SB_META_DIR" -maxdepth 1 -type f -name '*.json' -exec chown root:root {} + -exec chmod 600 {} +
   }
   if [[ -d "$SB_STATE_DIR" ]]; then
-    chown -R "$SB_USER":"$SB_GROUP" "$SB_STATE_DIR"
-    chmod 640 "$SB_STATE_DIR"/certs/*.key 2>/dev/null || true
+    chown -hRP "$SB_USER":"$SB_GROUP" "$SB_STATE_DIR"
+    if [[ -d "$SB_STATE_DIR/certs" ]]; then
+      find "$SB_STATE_DIR/certs" -maxdepth 1 -type f -name '*.key' -exec chmod 640 {} +
+    fi
   fi
 }
 
@@ -458,7 +519,7 @@ validate_config() {
 validate_and_restart() {
   info "执行 sing-box check 配置校验..."
   validate_config || return 1
-  systemctl restart sing-box
+  systemctl restart sing-box || return 1
   local i
   for i in 1 2 3; do
     sleep 1
@@ -519,7 +580,8 @@ cmd_tune() {
 
   install_tcpfit
   if [[ "$do_rollback" -eq 1 ]]; then
-    TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" rollback
+    TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" rollback || die "tcpfit 回滚失败"
+    rm -f "$SB_DIR/.sb-kit-tcpfit-tuned"
     return 0
   fi
 
@@ -532,7 +594,10 @@ cmd_tune() {
   fi
 
   info "执行 tcpfit 基础调优 (role=proxy, bw=${bw}Mbps, rtt=${rtt}ms)..."
-  TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" tune --role proxy --bw "$bw" --rtt "$rtt"
+  TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" tune --role proxy --bw "$bw" --rtt "$rtt" || die "tcpfit 调优失败"
+  if [[ -f "$SB_DIR/.managed-by-sb-kit" ]]; then
+    touch "$SB_DIR/.sb-kit-tcpfit-tuned" || die "无法记录 tcpfit 调优归属"
+  fi
 
   if [[ "$swap_size" == "auto" ]]; then
     local ram_mb
@@ -619,11 +684,51 @@ select_reality_sni() {
   echo "$chosen"
 }
 
+nft_unit_remove() {
+  local name="$1" unit="${SB_UNIT%/*}/${1}.service" rules="${NFT_DIR}/${1}.nft"
+  [[ -f "$unit" || -f "$rules" ]] || return 0
+  if [[ -f "$unit" ]]; then
+    # Detach RequiredBy before stopping the guard so this does not stop sing-box.
+    systemctl disable "${name}.service" >/dev/null || return 1
+    systemctl daemon-reload || return 1
+    systemctl stop "${name}.service" || return 1
+  fi
+  local tables
+  tables=$(nft list tables) || return 1
+  if grep -Fxq "table inet ${name}" <<< "$tables"; then
+    nft delete table inet "$name" || return 1
+  fi
+  rm -f "$rules" "$unit" || return 1
+  systemctl daemon-reload
+}
+
+activate_nft_unit() {
+  local name="$1" rules="$2"
+  systemctl daemon-reload && systemctl enable "${name}.service" >/dev/null || return 1
+  if systemctl is-active --quiet "${name}.service"; then
+    # Older units delete their table on stop. Update an active table in one nft transaction.
+    nft -f "$rules" || return 1
+  else
+    systemctl start "${name}.service" || return 1
+  fi
+  nft list table inet "$name" >/dev/null
+}
+
 nft_unit_install() {
-  # $1=unit/table name  $2=description  — loads ${NFT_DIR}/$1.nft now and on every boot.
-  local name="$1" desc="$2" nft_bin
-  nft_bin=$(command -v nft)
-  cat >"/etc/systemd/system/${name}.service" <<UNIT
+  # Read a complete nft transaction from stdin. Reload replaces a live table atomically.
+  local name="$1" desc="$2" dependency="$3" nft_bin tmp had_required=0
+  local required_link="${SB_UNIT}.requires/${1}.service"
+  [[ -L "$required_link" ]] && had_required=1
+  local unit="${SB_UNIT%/*}/${1}.service" rules="${NFT_DIR}/${1}.nft"
+  nft_bin=$(command -v nft) || { warn "缺少 nft，无法加载防火墙规则"; return 1; }
+  mkdir -p "$NFT_DIR" || return 1
+  tmp=$(mktemp -d "${NFT_DIR}/.sbkit.XXXXXX") || return 1
+  CLEANUP_PATHS+=("$tmp")
+  cat >"$tmp/rules" || return 1
+  nft -c -f "$tmp/rules" || return 1
+  if [[ -f "$unit" ]]; then cp -p "$unit" "$tmp/old-unit" || return 1; fi
+  if [[ -f "$rules" ]]; then cp -p "$rules" "$tmp/old-rules" || return 1; fi
+  cat >"$tmp/unit" <<UNIT || return 1
 [Unit]
 Description=${desc}
 After=network-pre.target
@@ -632,26 +737,30 @@ Before=sing-box.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=${nft_bin} -f ${NFT_DIR}/${name}.nft
-ExecStop=-${nft_bin} delete table inet ${name}
+ExecStart=${nft_bin} -f ${rules}
+ExecReload=${nft_bin} -f ${rules}
 
 [Install]
-WantedBy=multi-user.target
+${dependency}
 UNIT
-  systemctl daemon-reload
-  systemctl enable "${name}.service" >/dev/null 2>&1 || true
-  systemctl restart "${name}.service"
-}
-
-nft_unit_remove() {
-  local name="$1"
-  if [[ -f "/etc/systemd/system/${name}.service" ]]; then
-    systemctl disable --now "${name}.service" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/${name}.service"
-    systemctl daemon-reload
+  if install -m 644 "$tmp/unit" "${unit}.new" && mv -f "${unit}.new" "$unit" &&
+     chmod 644 "$tmp/rules" && mv -f "$tmp/rules" "$rules" &&
+     activate_nft_unit "$name" "$rules"; then
+    rm -rf "$tmp"
+    return 0
   fi
-  rm -f "${NFT_DIR}/${name}.nft"
-  command -v nft >/dev/null 2>&1 && nft delete table inet "${name}" 2>/dev/null || true
+
+  warn "防火墙规则 ${name} 未生效，正在恢复原规则"
+  rm -f "${unit}.new" || return 1
+  if [[ -f "$tmp/old-unit" && -f "$tmp/old-rules" ]]; then
+    if [[ "$had_required" == 0 && -L "$required_link" ]]; then rm -f "$required_link" || return 1; fi
+    cp -p "$tmp/old-unit" "$unit" && mv -f "$tmp/old-rules" "$rules" &&
+      systemctl daemon-reload && nft -f "$rules" && systemctl start "${name}.service" ||
+      warn "无法恢复 ${name}，请检查 nft 与 systemd 状态"
+  else
+    nft_unit_remove "$name" || warn "未能清理不完整的防火墙单元 ${name}"
+  fi
+  return 1
 }
 
 whitelist_name() { local t="$1"; echo "sbkit_wl_${t//[^a-zA-Z0-9_]/_}"; }
@@ -670,14 +779,12 @@ remove_port_whitelist() {
 
 setup_port_whitelist() {
   local tag="$1" port="$2" ips="$3"
-  need_cmd nft
   local name norm v4 v6
   name=$(whitelist_name "$tag")
-  norm=$(python3 "${LIB_DIR}/config_gen.py" normalize-ips "$ips") || die "白名单格式无效: ${ips}"
+  norm=$(python3 "${LIB_DIR}/config_gen.py" normalize-ips "$ips") || return 1
   v4=$(printf '%s\n' "$norm" | awk -F= '$1=="V4"{sub(/^V4=/,""); print; exit}')
   v6=$(printf '%s\n' "$norm" | awk -F= '$1=="V6"{sub(/^V6=/,""); print; exit}')
-  mkdir -p "$NFT_DIR"
-  cat >"${NFT_DIR}/${name}.nft" <<EOF2
+  nft_unit_install "$name" "sb-kit port whitelist (${tag})" "RequiredBy=sing-box.service" <<EOF2 || return 1
 table inet ${name}
 delete table inet ${name}
 table inet ${name} {
@@ -699,9 +806,28 @@ table inet ${name} {
     }
 }
 EOF2
-  nft -c -f "${NFT_DIR}/${name}.nft" || die "nft 白名单规则校验失败: ${NFT_DIR}/${name}.nft"
-  nft_unit_install "$name" "sb-kit port whitelist (${tag})"
   ok "已启用来源 IP 白名单 (${v4}${v4:+${v6:+, }}${v6})，仅锁定端口 ${port} (TCP/UDP, IPv4/IPv6)"
+}
+
+sync_legacy_whitelists() {
+  # v0.2.0 guards were wanted by multi-user.target but were not required by sing-box.
+  local meta tag name port whitelist
+  for meta in "$SB_META_DIR"/socks-*.json "$SB_META_DIR"/ss2022-*.json; do
+    [[ -f "$meta" ]] || continue
+    tag="${meta##*/}"
+    tag="${tag%.json}"
+    port="${tag##*-}"
+    valid_port "$port" || return 1
+    whitelist=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("whitelist") or "")' "$meta") || return 1
+    [[ -n "$whitelist" ]] || continue
+    name=$(whitelist_name "$tag")
+    if [[ -L "${SB_UNIT}.requires/${name}.service" ]] &&
+       grep -Fxq 'RequiredBy=sing-box.service' "${SB_UNIT%/*}/${name}.service" &&
+       systemctl is-active --quiet "${name}.service" && nft list table inet "$name" >/dev/null; then
+      continue
+    fi
+    setup_port_whitelist "$tag" "$port" "$whitelist" || return 1
+  done
 }
 
 remove_hy2_hopping() {
@@ -710,18 +836,20 @@ remove_hy2_hopping() {
 
 setup_hy2_hopping() {
   local tag="$1" port="$2" hop_range="$3"
-  need_cmd nft
   local name start_p end_p
   name=$(hopping_name "$tag")
-  start_p="${hop_range%%[:-]*}"
-  end_p="${hop_range##*[:-]}"
-  valid_port "$start_p" && valid_port "$end_p" && [[ "$start_p" -lt "$end_p" ]] \
-    || die "无效端口跳跃范围: ${hop_range}（示例: 35000:36000）"
-  if [[ "$port" -ge "$start_p" && "$port" -le "$end_p" ]]; then
-    die "端口跳跃区间 ${start_p}-${end_p} 不能包含 hy2 监听端口 ${port}"
+  if [[ ! "$hop_range" =~ ^([0-9]{1,5})[:-]([0-9]{1,5})$ ]]; then
+    warn "无效端口跳跃范围: ${hop_range}（示例: 35000:36000）"
+    return 1
   fi
-  mkdir -p "$NFT_DIR"
-  cat >"${NFT_DIR}/${name}.nft" <<EOF2
+  start_p=$((10#${BASH_REMATCH[1]}))
+  end_p=$((10#${BASH_REMATCH[2]}))
+  valid_port "$start_p" && valid_port "$end_p" && [[ "$start_p" -lt "$end_p" ]] || return 1
+  if [[ "$port" -ge "$start_p" && "$port" -le "$end_p" ]]; then
+    warn "端口跳跃区间 ${start_p}-${end_p} 不能包含 hy2 监听端口 ${port}"
+    return 1
+  fi
+  nft_unit_install "$name" "sb-kit Hysteria2 port hopping (${tag})" "WantedBy=multi-user.target" <<EOF2 || return 1
 table inet ${name}
 delete table inet ${name}
 table inet ${name} {
@@ -731,9 +859,45 @@ table inet ${name} {
     }
 }
 EOF2
-  nft -c -f "${NFT_DIR}/${name}.nft" || die "nft 端口跳跃规则校验失败: ${NFT_DIR}/${name}.nft"
-  nft_unit_install "$name" "sb-kit Hysteria2 UDP port hopping (${start_p}-${end_p} -> ${port})"
   ok "已启用 Hysteria2 UDP 端口跳跃 (nftables, IPv4/IPv6): ${start_p}-${end_p} -> ${port}"
+}
+
+apply_node_firewall() {
+  local proto="$1" tag="$2" port="$3" whitelist="$4" hopping="$5"
+  if [[ ( "$proto" == "ss2022" || "$proto" == "socks" ) && -n "$whitelist" ]]; then
+    setup_port_whitelist "$tag" "$port" "$whitelist" || return 1
+  elif [[ "$proto" == "hy2" && -n "$hopping" ]]; then
+    setup_hy2_hopping "$tag" "$port" "$hopping" || return 1
+  fi
+}
+
+remove_node_firewall() {
+  remove_port_whitelist "$1" && remove_hy2_hopping "$1"
+}
+
+require_unused_node_tag() {
+  local tag="$1"
+  if [[ -e "$SB_CONF_DIR/$tag.json" || -e "$SB_META_DIR/$tag.json" ]]; then
+    die "目标节点已存在: ${tag}"
+  fi
+}
+
+publish_node_files() {
+  local stage="$1" tag="$2" old_tag="${3:-}"
+  chown root:"$SB_GROUP" "$stage/conf/$tag.json" &&
+    mv -f "$stage/meta/$tag.json" "$SB_META_DIR/$tag.json" &&
+    mv -f "$stage/conf/$tag.json" "$SB_CONF_DIR/$tag.json" || return 1
+  if [[ -n "$old_tag" && "$old_tag" != "$tag" ]]; then
+    rm -f "$SB_CONF_DIR/$old_tag.json" "$SB_META_DIR/$old_tag.json"
+  fi
+}
+
+restore_node_service() {
+  if [[ "$1" == 1 ]]; then
+    validate_and_restart
+  else
+    systemctl stop sing-box
+  fi
 }
 
 print_node_result() {
@@ -916,6 +1080,12 @@ cmd_add() {
     meta_dir="${out_dir}/meta"
     state_dir="${out_dir}/state"
     mkdir -p "$conf_dir" "$meta_dir" "$state_dir"
+  else
+    require_unused_node_tag "${proto}-${port}"
+    out_dir=$(mktemp -d "${SB_DIR}/.add.XXXXXX") || return 1
+    CLEANUP_PATHS+=("$out_dir")
+    conf_dir="${out_dir}/conf"
+    meta_dir="${out_dir}/meta"
   fi
 
   local sb_ver
@@ -946,7 +1116,7 @@ cmd_add() {
   [[ "$self_signed" -eq 1 ]] && py_args+=(--self-signed)
 
   local gen_out tag
-  gen_out=$(SB_CF_TOKEN="$cf_token" python3 "${py_args[@]}")
+  gen_out=$(SB_CF_TOKEN="$cf_token" python3 "${py_args[@]}") || return 1
   tag=$(echo "$gen_out" | awk -F= '$1=="TAG"{print $2; exit}')
 
   if [[ "$generate_only" -eq 1 ]]; then
@@ -955,35 +1125,20 @@ cmd_add() {
     return 0
   fi
 
-  # Pre-check config as sing-box user, then apply firewall guard BEFORE restarting service (zero open-port window).
-  if ! validate_config; then
-    rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json"
-    die "新节点未通过 sing-box check，已自动回滚该节点文件"
-  fi
+  local was_active=0
+  systemctl is-active --quiet sing-box && was_active=1
+  # A service restart at any time may load conf/. Keep the candidate private until protected.
+  apply_node_firewall "$proto" "$tag" "$port" "$whitelist" "$hop_range" ||
+    die "防火墙规则应用失败，已放弃新增节点"
 
-  local wl_applied=0 hop_applied=0
-  if [[ ("$proto" == "ss2022" || "$proto" == "socks") && -n "$whitelist" ]]; then
-    if ! setup_port_whitelist "$tag" "$port" "$whitelist"; then
-      rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json"
-      die "白名单规则应用失败，已自动回滚该节点文件"
-    fi
-    wl_applied=1
+  if ! publish_node_files "$out_dir" "$tag" || ! validate_and_restart; then
+    rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json" ||
+      die "无法撤销新增配置，保留防火墙规则"
+    restore_node_service "$was_active" || die "恢复原服务状态失败，保留防火墙规则"
+    remove_node_firewall "$tag" || die "已恢复原服务，清理新规则失败"
+    die "节点未能启用，已恢复原服务与防火墙规则"
   fi
-  if [[ "$proto" == "hy2" && -n "$hop_range" ]]; then
-    if ! setup_hy2_hopping "$tag" "$port" "$hop_range"; then
-      rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json"
-      [[ "$wl_applied" -eq 1 ]] && remove_port_whitelist "$tag"
-      die "端口跳跃规则应用失败，已自动回滚该节点文件"
-    fi
-    hop_applied=1
-  fi
-
-  if ! validate_and_restart; then
-    rm -f "${SB_CONF_DIR}/${tag}.json" "${SB_META_DIR}/${tag}.json"
-    [[ "$wl_applied" -eq 1 ]] && remove_port_whitelist "$tag"
-    [[ "$hop_applied" -eq 1 ]] && remove_hy2_hopping "$tag"
-    die "sing-box 启动失败，已自动回滚新节点与防火墙规则"
-  fi
+  rm -rf "$out_dir"
 
   print_node_result "$tag" "$gen_out"
 }
@@ -1041,12 +1196,12 @@ cmd_modify() {
     esac
   done
 
-  local cur_proto cur_port old_hop
-  IFS='|' read -r cur_proto cur_port old_hop < <(
+  local cur_proto cur_port old_hop old_wl
+  IFS='|' read -r cur_proto cur_port old_hop old_wl < <(
     python3 - "${SB_META_DIR}/${tag}.json" <<'PY'
 import json, sys
 m = json.load(open(sys.argv[1], encoding="utf-8"))
-print(f"{m.get('proto','')}|{m.get('port','')}|{m.get('hop_range','')}")
+print(f"{m.get('proto','')}|{m.get('port','')}|{m.get('hop_range','')}|{m.get('whitelist','')}")
 PY
   )
 
@@ -1087,21 +1242,27 @@ PY
 
   if [[ -n "$new_port" ]]; then
     new_port=$(pick_free_port "$new_port" "$(proto_net_type "$cur_proto")" "$has_flags" "$cur_port")
+    if [[ "$new_port" != "$cur_port" ]]; then require_unused_node_tag "${cur_proto}-${new_port}"; fi
   fi
 
-  local snap_dir
-  snap_dir=$(mktemp -d)
+  local snap_dir was_active=0
+  snap_dir=$(mktemp -d "${SB_DIR}/.modify.XXXXXX") || return 1
   CLEANUP_PATHS+=("$snap_dir")
-  cp -a "${SB_CONF_DIR}" "${snap_dir}/conf"
-  cp -a "${SB_META_DIR}" "${snap_dir}/meta"
+  mkdir "$snap_dir/conf" "$snap_dir/meta" &&
+    cp -p "$SB_CONF_DIR/$tag.json" "$snap_dir/conf/$tag.json" &&
+    cp -p "$SB_META_DIR/$tag.json" "$snap_dir/meta/$tag.json" || return 1
+  # The generator publishes via rename, so these links retain the previous files.
+  ln "$snap_dir/conf/$tag.json" "$snap_dir/old-conf" &&
+    ln "$snap_dir/meta/$tag.json" "$snap_dir/old-meta" || return 1
+  systemctl is-active --quiet sing-box && was_active=1
 
   local sb_ver
   sb_ver=$(sb_version)
   local -a py_args=(
     "${LIB_DIR}/config_gen.py" modify
     --tag "$tag"
-    --conf-dir "$SB_CONF_DIR"
-    --meta-dir "$SB_META_DIR"
+    --conf-dir "$snap_dir/conf"
+    --meta-dir "$snap_dir/meta"
     --state-dir "$SB_STATE_DIR"
     --sb-ver "${sb_ver:-1.14.4}"
   )
@@ -1117,59 +1278,41 @@ PY
   [[ "$rotate" -eq 1 ]] && py_args+=(--rotate-creds)
 
   local gen_out new_tag final_port final_wl final_hop
-  gen_out=$(python3 "${py_args[@]}")
+  gen_out=$(python3 "${py_args[@]}") || return 1
   new_tag=$(echo "$gen_out" | awk -F= '$1=="TAG"{print $2; exit}')
   final_port=$(echo "$gen_out" | awk -F= '$1=="PORT"{print $2; exit}')
   final_wl=$(echo "$gen_out" | awk -F= '$1=="WHITELIST"{sub(/^WHITELIST=/,""); print; exit}')
   final_hop=$(echo "$gen_out" | awk -F= '$1=="HOP_RANGE"{sub(/^HOP_RANGE=/,""); print; exit}')
 
-  if ! validate_config; then
-    rm -rf "${SB_CONF_DIR:?}"/* "${SB_META_DIR:?}"/*
-    cp -a "${snap_dir}/conf/." "${SB_CONF_DIR}/"
-    cp -a "${snap_dir}/meta/." "${SB_META_DIR}/"
-    rm -rf "$snap_dir"
-    die "修改后的配置未通过 sing-box check，已自动恢复原配置"
+  apply_node_firewall "$cur_proto" "$new_tag" "$final_port" "$final_wl" "$final_hop" ||
+    die "新规则应用失败，已放弃节点修改"
+
+  if ! publish_node_files "$snap_dir" "$new_tag" "$tag" || ! validate_and_restart; then
+    if [[ "$new_tag" != "$tag" ]]; then
+      rm -f "$SB_CONF_DIR/$new_tag.json" "$SB_META_DIR/$new_tag.json" ||
+        die "无法撤销新节点，保留防火墙规则"
+    fi
+    # On a port move the previous guard is still intact; only in-place changes need reloading.
+    local guard_restored=1
+    if [[ "$new_tag" == "$tag" && ( -n "$final_wl" || -n "$final_hop" ) ]]; then
+      apply_node_firewall "$cur_proto" "$tag" "$cur_port" "$old_wl" "$old_hop" || guard_restored=0
+    fi
+    mv -f "$snap_dir/old-conf" "$SB_CONF_DIR/$tag.json" &&
+      mv -f "$snap_dir/old-meta" "$SB_META_DIR/$tag.json" ||
+      die "恢复原节点文件失败，保留防火墙规则"
+    if [[ "$guard_restored" != 1 ]]; then
+      systemctl stop sing-box || die "恢复原防火墙和停止服务均失败，请检查服务状态"
+      die "原配置已恢复，服务已停止，请先恢复原防火墙"
+    fi
+    restore_node_service "$was_active" || die "恢复原服务状态失败，保留防火墙规则"
+    if [[ "$new_tag" != "$tag" || ( -z "$old_wl" && -z "$old_hop" ) ]]; then
+      remove_node_firewall "$new_tag" || die "已恢复原服务，清理新规则失败"
+    fi
+    die "节点未能启用，已恢复原配置与防火墙规则"
   fi
 
-  # Apply new whitelist BEFORE restarting sing-box (avoid open-port window on new port).
-  local wl_new_applied=0
-  if [[ ("$cur_proto" == "ss2022" || "$cur_proto" == "socks") && -n "$final_wl" ]]; then
-    if ! setup_port_whitelist "$new_tag" "$final_port" "$final_wl"; then
-      rm -rf "${SB_CONF_DIR:?}"/* "${SB_META_DIR:?}"/*
-      cp -a "${snap_dir}/conf/." "${SB_CONF_DIR}/"
-      cp -a "${snap_dir}/meta/." "${SB_META_DIR}/"
-      rm -rf "$snap_dir"
-      die "新白名单规则应用失败，已自动恢复原配置"
-    fi
-    wl_new_applied=1
-  fi
-
-  if ! validate_and_restart; then
-    if [[ "$wl_new_applied" -eq 1 && "$new_tag" != "$tag" ]]; then
-      remove_port_whitelist "$new_tag"
-    fi
-    rm -rf "${SB_CONF_DIR:?}"/* "${SB_META_DIR:?}"/*
-    cp -a "${snap_dir}/conf/." "${SB_CONF_DIR}/"
-    cp -a "${snap_dir}/meta/." "${SB_META_DIR}/"
-    validate_config >/dev/null 2>&1 || true
-    systemctl restart sing-box 2>/dev/null || true
-    rm -rf "$snap_dir"
-    die "sing-box 启动失败，已自动恢复原配置"
-  fi
-
-  if [[ "$cur_proto" == "ss2022" || "$cur_proto" == "socks" ]]; then
-    if [[ "$new_tag" != "$tag" || "$clear_wl" -eq 1 ]]; then
-      remove_port_whitelist "$tag"
-    fi
-  fi
-
-  if [[ "$cur_proto" == "hy2" ]]; then
-    if [[ "$new_tag" != "$tag" || "$clear_hop" -eq 1 || ( -n "$old_hop" && "$final_hop" != "$old_hop" ) ]]; then
-      remove_hy2_hopping "$tag"
-    fi
-    if [[ -n "$final_hop" ]]; then
-      setup_hy2_hopping "$new_tag" "$final_port" "$final_hop"
-    fi
+  if [[ "$new_tag" != "$tag" || ( -z "$final_wl" && -z "$final_hop" ) ]]; then
+    remove_node_firewall "$tag" || die "节点已更新，清理旧防火墙规则失败"
   fi
 
   rm -rf "$snap_dir"
@@ -1195,16 +1338,27 @@ cmd_del() {
   local conf_file="${SB_CONF_DIR}/${target}.json"
   [[ -f "$conf_file" || -f "${SB_META_DIR}/${target}.json" ]] || die "找不到节点: ${target}"
 
-  rm -f "$conf_file" "${SB_META_DIR}/${target}.json"
-  remove_port_whitelist "$target"
-  remove_hy2_hopping "$target"
+  local stage was_active=0 stopped=0
+  stage=$(mktemp -d "${SB_DIR}/.del.XXXXXX") || return 1
+  CLEANUP_PATHS+=("$stage")
+  systemctl is-active --quiet sing-box && was_active=1
+  if [[ -f "$conf_file" ]]; then mv "$conf_file" "$stage/node.json" || return 1; fi
 
   if compgen -G "${SB_CONF_DIR}/*.json" >/dev/null 2>&1; then
-    validate_and_restart || die "删除后 sing-box 校验失败"
+    validate_and_restart && stopped=1
   else
-    systemctl stop sing-box 2>/dev/null || true
-    warn "已删除最后一个节点并停止 sing-box"
+    systemctl stop sing-box && stopped=1
   fi
+  if [[ "$stopped" != 1 ]]; then
+    if [[ -f "$stage/node.json" ]]; then mv "$stage/node.json" "$conf_file" || return 1; fi
+    restore_node_service "$was_active" || die "删除失败，原配置与防火墙保留，恢复服务失败"
+    die "删除失败，已恢复原节点并保留其防火墙"
+  fi
+
+  # Keep metadata for a retry if cleanup fails after the listener is gone.
+  remove_node_firewall "$target" || die "监听已停止，防火墙清理失败，可重试删除"
+  rm -f "${SB_META_DIR}/${target}.json" || return 1
+  rm -rf "$stage"
   ok "已删除节点: ${target}"
 }
 
@@ -1290,41 +1444,79 @@ cmd_install() {
   cmd_add "${add_args[@]}"
 }
 
-cmd_regen() {
+# Both directories live on the same Linux filesystem. Each exchange keeps the
+# live path present, including if systemd opens it during a restart.
+exchange_regen_dirs() {
+  python3 - "$SB_CONF_DIR" "$SB_META_DIR" "$1" <<'PY'
+import ctypes
+import os
+import sys
+from pathlib import Path
+
+conf, meta, stage = map(Path, sys.argv[1:])
+renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+
+def exchange(live, candidate):
+    at_fdcwd, rename_exchange = -100, 2
+    if renameat2(at_fdcwd, os.fsencode(live), at_fdcwd, os.fsencode(candidate), rename_exchange):
+        raise OSError(ctypes.get_errno(), f"cannot exchange {live} and {candidate}")
+
+exchange(meta, stage / "meta")
+try:
+    exchange(conf, stage / "conf")
+except BaseException:
+    exchange(meta, stage / "meta")
+    raise
+PY
+}
+
+cmd_regen() (
   need_root
   acquire_lock
   [[ -x "$SB_BIN" ]] || die "未检测到 sing-box，请先运行: sbctl install"
-  [[ -d "$SB_META_DIR" ]] && compgen -G "${SB_META_DIR}/*.json" >/dev/null 2>&1 || die "当前没有可重建的节点元数据"
+  compgen -G "${SB_META_DIR}/*.json" >/dev/null || die "当前没有可重建的节点元数据"
 
-  local snap_dir sb_ver
-  snap_dir=$(mktemp -d)
-  CLEANUP_PATHS+=("$snap_dir")
-  cp -a "${SB_CONF_DIR}" "${snap_dir}/conf"
-  cp -a "${SB_META_DIR}" "${snap_dir}/meta"
+  local stage keep_stage=0 was_active=0 sb_ver out count
+  stage=$(mktemp -d "${SB_DIR}/.regen.XXXXXXXX") || die "无法创建重建暂存目录"
+  trap 'if [[ "$keep_stage" == 1 ]]; then warn "保留重建目录供恢复: $stage"; else rm -rf -- "$stage"; fi' EXIT
+  chown root:"$SB_GROUP" "$stage" && chmod 710 "$stage" || die "无法设置暂存目录权限"
+  cp -a "$SB_CONF_DIR" "$stage/conf" && cp -a "$SB_META_DIR" "$stage/meta" || die "无法暂存当前配置"
 
-  sb_ver=$(sb_version)
+  sb_ver=$(sb_version) || die "无法读取 sing-box 版本"
   info "按 sing-box ${sb_ver} 语法重建全部入站配置..."
-  local out count
   out=$(python3 "${LIB_DIR}/config_gen.py" regen \
-    --conf-dir "$SB_CONF_DIR" \
-    --meta-dir "$SB_META_DIR" \
-    --state-dir "$SB_STATE_DIR" \
-    --sb-ver "$sb_ver" \
-    --sb-bin "$SB_BIN")
-  count=$(echo "$out" | awk -F= '$1=="COUNT"{print $2; exit}')
+    --conf-dir "$stage/conf" --meta-dir "$stage/meta" --state-dir "$SB_STATE_DIR" \
+    --sb-ver "$sb_ver" --sb-bin "$SB_BIN") || die "生成失败，原配置仍在使用"
+  count=$(awk -F= '$1=="COUNT"{print $2}' <<<"$out")
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "未生成完整的节点配置"
+  local node_file tag
+  local -a nodes=("$SB_META_DIR"/*.json)
+  [[ "$count" -eq "${#nodes[@]}" ]] || die "重建数量与原有节点数不一致"
+  for node_file in "${nodes[@]}"; do
+    tag=$(basename "$node_file")
+    chown root:"$SB_GROUP" "$stage/conf/$tag" || die "无法设置节点配置权限"
+  done
+  run_as_service_user "$SB_BIN" check -c "$SB_CONFIG" -C "$stage/conf" || die "候选配置校验失败，原配置仍在使用"
+  sync_legacy_whitelists || die "现有白名单未能生效，原配置仍在使用"
 
+  systemctl is-active --quiet sing-box && was_active=1
+  keep_stage=1
+  exchange_regen_dirs "$stage" || die "切换重建配置失败"
   if ! validate_and_restart; then
-    rm -rf "${SB_CONF_DIR:?}"/* "${SB_META_DIR:?}"/*
-    cp -a "${snap_dir}/conf/." "${SB_CONF_DIR}/"
-    cp -a "${snap_dir}/meta/." "${SB_META_DIR}/"
-    validate_config >/dev/null 2>&1 || true
-    systemctl restart sing-box 2>/dev/null || true
-    rm -rf "$snap_dir"
-    die "重建后的配置未通过 sing-box check，已自动恢复原配置"
+    exchange_regen_dirs "$stage" || die "恢复原配置失败"
+    if [[ "$was_active" == 1 ]]; then
+      validate_and_restart || die "原配置已恢复，服务重启失败"
+    else
+      systemctl stop sing-box || die "原配置已恢复，服务停止失败"
+    fi
+    keep_stage=0
+    die "服务启动失败，已恢复原配置"
   fi
-  rm -rf "$snap_dir"
-  ok "已按 sing-box ${sb_ver} 重建并验收 ${count:-0} 个节点配置"
-}
+  keep_stage=0
+  ok "已按 sing-box ${sb_ver} 重建并验收 ${count} 个节点配置"
+)
 
 cmd_update() {
   need_root
@@ -1349,6 +1541,13 @@ cmd_version() {
   printf 'sb-kit %s (sing-box: %s)\n' "$SBKIT_VERSION" "${sv:-未安装}"
 }
 
+cmd_sync() {
+  need_root
+  acquire_lock
+  install_self 0
+  cmd_version
+}
+
 cmd_audit() {
   need_root
   bash "${LIB_DIR}/audit.sh"
@@ -1357,27 +1556,83 @@ cmd_audit() {
 cmd_uninstall() {
   need_root
   acquire_lock
-  local keep_tcpfit=0
-  [[ "${1:-}" == "--keep-tcpfit" ]] && keep_tcpfit=1
-
-  systemctl disable --now sing-box 2>/dev/null || true
-  rm -f "$SB_UNIT" "$SB_LOGROTATE" "$SB_BIN" "${SB_BIN}.bak" "$SB_CTL_DST"
-  rm -rf "$SB_DIR" "$SB_LOG_DIR" "$SB_STATE_DIR" "$SB_LIB_DST"
-
-  local svc
-  for svc in /etc/systemd/system/sbkit_*.service /etc/systemd/system/sbkit-hop-*.service; do
-    [[ -f "$svc" ]] || continue
-    systemctl disable --now "$(basename "$svc")" 2>/dev/null || true
-    rm -f "$svc"
-  done
-  rm -f "${NFT_DIR}"/sbkit_*.nft
-  systemctl daemon-reload
-
-  if [[ "$keep_tcpfit" -eq 0 && -x "$TCPFIT_BIN" ]]; then
-    info "回滚 tcpfit 调优..."
-    TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" rollback || true
+  require_managed_installation
+  local keep_tcpfit=0 marker="${SB_DIR}/.managed-by-sb-kit" origin=legacy snapshot="" svc name directory
+  if [[ $# -gt 0 ]]; then
+    [[ $# -eq 1 && "$1" == "--keep-tcpfit" ]] || die "用法: sbctl uninstall [--keep-tcpfit]"
+    keep_tcpfit=1
   fi
-  ok "sb-kit 与 sing-box 已卸载干净"
+  if [[ -s "$marker" ]]; then
+    [[ "$(sed -n '1p' "$marker")" == sb-kit-v1 ]] || die "无法识别托管标记，已中止卸载"
+    origin=$(sed -n '2p' "$marker")
+    if [[ "$origin" != fresh ]]; then
+      [[ "$origin" =~ ^pre-install-[[:alnum:]._-]+$ ]] || die "托管记录中的备份名称无效"
+      snapshot="${SB_BACKUP_ROOT}/${origin}"
+      [[ -d "$snapshot" && ! -L "$snapshot" && -f "$snapshot/complete" ]] || die "原实例备份缺失，已中止卸载: $snapshot"
+    fi
+  fi
+  [[ -r "${LIB_DIR}/managed_files.py" ]] || die "缺少卸载组件 managed_files.py，请重新同步 sb-kit"
+  if [[ -f "$SB_UNIT" ]]; then
+    systemctl disable --now sing-box || die "无法停用托管服务，已中止卸载"
+  fi
+  python3 "${LIB_DIR}/managed_files.py" "$SB_DIR" "$SB_STATE_DIR" "$SB_LOG_DIR" "$snapshot" "$origin" || die "清理节点失败；托管标记和备份仍保留"
+  local unit_dir="${SB_UNIT%/*}"
+  for svc in "${unit_dir}"/sbkit_*.service "${unit_dir}"/sbkit-hop-*.service; do
+    [[ -f "$svc" ]] || continue
+    [[ ! -L "$svc" ]] && grep -Eq '^Description=sb-kit (port whitelist|Hysteria2 UDP port hopping) ' "$svc" || continue
+    name="${svc##*/}"
+    case "$name" in
+      sbkit_wl_*.service|sbkit_hop_*.service)
+        nft_unit_remove "${name%.service}" || die "移除 $name 的运行规则失败"
+        continue ;;
+    esac
+    systemctl disable --now "$name" || die "停用 $name 失败"
+    rm -f "$svc" || die "删除 $name 失败"
+    name="${name%.service}"
+    rm -f "${NFT_DIR}/${name}.nft" || die "删除规则 $name 失败"
+    if command -v nft >/dev/null 2>&1 && nft list table inet "$name" >/dev/null 2>&1; then
+      nft delete table inet "$name" || die "移除运行中的规则 $name 失败"
+    fi
+  done
+  local -a destinations=("$SB_CONFIG" "$SB_RULES_DIR/geoip-cn.srs" "$SB_UNIT" "$SB_LOGROTATE" "$SB_BIN" "${SB_BIN}.bak")
+  local -a sources=(etc-sing-box/config.json etc-sing-box/rules/geoip-cn.srs local.service logrotate sing-box previous-core-backup)
+  local i original target
+  for i in "${!destinations[@]}"; do
+    target="${destinations[$i]}"
+    original="${snapshot}/${sources[$i]}"
+    if [[ -n "$snapshot" && ( -e "$original" || -L "$original" ) ]]; then
+      mkdir -p "${target%/*}" && rm -f "$target" && cp -a "$original" "$target" || die "还原 $target 失败，原件位于 $snapshot"
+    else
+      rm -f "$target" || die "清理 $target 失败"
+    fi
+  done
+  systemctl daemon-reload || die "重新加载 systemd 失败"
+  if [[ -n "$snapshot" ]]; then
+    if [[ -f "$snapshot/was-enabled" ]]; then systemctl enable sing-box || die "恢复原服务启用状态失败"; fi
+    if [[ -f "$snapshot/was-active" ]]; then systemctl start sing-box || die "恢复原服务失败，请检查 $snapshot"; fi
+    ok "已恢复接管前的文件及服务状态，原备份位于: $snapshot"
+  elif [[ "$origin" == legacy ]]; then
+    warn "历史托管标记未记录接管来源。旧备份可在 $SB_BACKUP_ROOT 查阅。"
+  fi
+  if [[ "$keep_tcpfit" -eq 0 && -x "$TCPFIT_BIN" && -f "$SB_DIR/.sb-kit-tcpfit-tuned" ]]; then
+    info "回滚 tcpfit 调优..."
+    TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" rollback || die "tcpfit 回滚失败"
+  fi
+  rm -f "$marker" "$SB_DIR/.sb-kit-tcpfit-tuned" "$SB_CTL_DST" || die "移除 sb-kit 管理文件失败"
+  for name in audit.sh config_gen.py sni_probe.py managed_files.py VERSION; do
+    rm -f "$SB_LIB_DST/$name" || die "移除 sb-kit 组件 $name 失败"
+  done
+  for directory in "$SB_RULES_DIR" "$SB_DIR" "$SB_LIB_DST"; do
+    if [[ -n "$snapshot" && ( ( "$directory" == "$SB_RULES_DIR" && -d "$snapshot/etc-sing-box/rules" ) ||
+                               ( "$directory" == "$SB_DIR" && -d "$snapshot/etc-sing-box" ) ) ]]; then
+      continue
+    fi
+    rmdir "$directory" 2>/dev/null || true
+  done
+  for directory in "$SB_DIR" "$SB_LOG_DIR" "$SB_STATE_DIR" "$SB_LIB_DST"; do
+    [[ ! -d "$directory" ]] || info "已保留已有资料: $directory"
+  done
+  ok "sb-kit 托管的服务与文件已卸载"
 }
 
 show_help() {
@@ -1397,6 +1652,7 @@ sbctl (sb-kit ${SBKIT_VERSION}) — 纯 sing-box + tcpfit 精简管理工具（�
   sbctl audit                       一键只读安全巡检
   sbctl update [ver]                仅升级 sing-box 核心（SHA-256 校验，失败自动回滚）
   sbctl regen                       按当前 sing-box 版本语法从 meta 重建全部入站配置
+  sbctl sync                        同步当前目录的 sbctl 与 lib 到 /usr/local
   sbctl --version                   查看 sb-kit 与 sing-box 版本
   sbctl uninstall [--keep-tcpfit]   彻底卸载
 
@@ -1572,13 +1828,24 @@ main() {
   local sub="$1"
   shift
   case "$sub" in
-    -h|--help|help)    show_help; return 0 ;;
+    -h|--help|help)       show_help; return 0 ;;
     -v|--version|version) cmd_version; return 0 ;;
-    uninstall)         cmd_uninstall "$@"; return 0 ;;
+    sync)                 cmd_sync; return 0 ;;
+    uninstall)            cmd_uninstall "$@"; return 0 ;;
   esac
 
-  # Auto-sync /usr/local/bin/sbctl when invoked as root from a staging copy (e.g. deploy.sh).
-  [[ "$sub" != "links" && "$sub" != "link" && "$sub" != "url" && "$sub" != "yaml" && "$sub" != "clash" ]] && install_self 1
+  # Auto-sync /usr/local/bin/sbctl when invoked as root from a staging copy,
+  # but keep read-only commands and --generate-only dry-runs side-effect free.
+  local skip_sync=0 arg
+  case "$sub" in
+    links|link|url|yaml|clash|audit|check) skip_sync=1 ;;
+    add)
+      for arg in "$@"; do
+        [[ "$arg" == "--generate-only" ]] && { skip_sync=1; break; }
+      done
+      ;;
+  esac
+  [[ "$skip_sync" -eq 0 ]] && install_self 1
 
   case "$sub" in
     install)           cmd_install "$@" ;;
@@ -1596,4 +1863,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

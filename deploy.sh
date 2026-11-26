@@ -40,12 +40,12 @@ fi
 REMOTE_STAGE="/tmp/sb-kit-stage"
 
 echo "[*] 正在推送 sb-kit 到 ${TARGET}:${SSH_PORT}（不留任何 GitHub Token）..."
-COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -czf - sbctl.sh lib | \
+COPYFILE_DISABLE=1 tar --exclude='__pycache__' -C "$SCRIPT_DIR" -czf - sbctl.sh lib | \
   ssh -p "$SSH_PORT" "$TARGET" "rm -rf '${REMOTE_STAGE}' && mkdir -p '${REMOTE_STAGE}' && tar -xzf - -C '${REMOTE_STAGE}' && chmod +x '${REMOTE_STAGE}/sbctl.sh' '${REMOTE_STAGE}/lib/'*.sh '${REMOTE_STAGE}/lib/'*.py"
 
 if [[ "${1:-}" == "sync" ]]; then
   echo "[+] 同步远端 /usr/local/bin/sbctl 与 /usr/local/lib/sb-kit..."
-  ssh -p "$SSH_PORT" "$TARGET" "bash '${REMOTE_STAGE}/sbctl.sh' --version >/dev/null && mkdir -p /usr/local/lib/sb-kit && cp -f '${REMOTE_STAGE}/lib/'* /usr/local/lib/sb-kit/ && chmod 755 /usr/local/lib/sb-kit/*.py /usr/local/lib/sb-kit/*.sh && cp -f '${REMOTE_STAGE}/sbctl.sh' /usr/local/bin/sbctl.new && chmod 755 /usr/local/bin/sbctl.new && mv -f /usr/local/bin/sbctl.new /usr/local/bin/sbctl && rm -rf '${REMOTE_STAGE}' && /usr/local/bin/sbctl --version"
+  ssh -p "$SSH_PORT" "$TARGET" "bash '${REMOTE_STAGE}/sbctl.sh' sync; rc=\$?; rm -rf '${REMOTE_STAGE}'; exit \$rc"
   exit 0
 fi
 

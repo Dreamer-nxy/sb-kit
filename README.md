@@ -1,6 +1,7 @@
 # sb-kit
 
 面向自用 VPS 的**纯 `sing-box` + `tcpfit` 精简部署与管理工具**。
+适用系统：`Debian 11+ / Ubuntu 20.04+`（`systemd` + `glibc`，`amd64 / arm64`）。
 
 ## 设计原则
 
@@ -34,6 +35,10 @@
 # 直接一行无交互一键安装（443 VLESS-REALITY + 自动 BBR 调优）：
 ./deploy.sh root@1.2.3.4:50222 install --proto vless-reality --port 443 --bw 500 --sni auto --non-interactive
 ```
+
+已有 v0.2.0 节点的机器，先执行 `deploy.sh … sync`，再在 VPS 上运行 `sbctl regen`。重建会先校验全部节点，并把原有 SOCKS 和 SS2022 白名单升级为 sing-box 的启动依赖。服务启动失败时会恢复上一套配置。
+
+接管已有 sing-box 实例时，安装器先备份原配置、核心和服务状态。卸载会检查托管标记，保留手工文件，并按本次接管记录恢复原实例。旧版的空标记未记录原实例归属，历史备份可在 `/var/backups/sb-kit/` 查阅。
 
 ### 方式二（在 VPS 上使用只读 Fine-grained PAT 拉取）
 

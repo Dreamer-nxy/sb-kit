@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Exercise install / uninstall ownership entirely under a temporary root.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../sbctl.sh
+source "$ROOT/sbctl.sh" --help >/dev/null
+WORK=$(mktemp -d)
+trap 'cleanup_paths; rm -rf "$WORK"' EXIT
+export TMPDIR="$WORK/tmp"
+mkdir -p "$TMPDIR"
+fail() { echo "FAIL: $*" >&2; exit 1; }
+need_root() { :; }
+acquire_lock() { :; }
+chown() { :; }
+id() { echo 0; }
+systemctl() {
+  printf '%s\n' "$*" >>"$WORK/systemctl.calls"
+  case "$1" in
+    show) [[ ! -e "$WORK/fragment" ]] || cat "$WORK/fragment" ;;
+    is-active|is-enabled) [[ -f "$WORK/$1" ]] ;;
+  esac
+}
+# These fixture paths are read by the sourced sbctl functions.
+# shellcheck disable=SC2034
+set_paths() {
+  local base="$WORK/$1"
+  SB_DIR="$base/etc/sing-box"; SB_CONFIG="$SB_DIR/config.json"; SB_CONF_DIR="$SB_DIR/conf"
+  SB_META_DIR="$SB_DIR/meta"; SB_RULES_DIR="$SB_DIR/rules"; SB_STATE_DIR="$base/state"; SB_LOG_DIR="$base/logs"
+  SB_UNIT="$base/units/sing-box.service"; SB_LOGROTATE="$base/rotate"; SB_BIN="$base/bin/sing-box"
+  SB_CTL_DST="$base/bin/sbctl"; SB_LIB_DST="$base/lib"; SB_BACKUP_ROOT="$base/backups"; NFT_DIR="$base/nft"
+  TCPFIT_BIN="$base/bin/tcpfit"; PRE_INSTALL_BACKUP=""
+  mkdir -p "$base/bin" "$base/units"
+  rm -f "$WORK/fragment" "$WORK/is-active" "$WORK/is-enabled"
+}
+
+# The real GitHub response exceeds Linux's per-argument limit.
+set_paths release
+mkdir -p "$WORK/archive/sing-box-1.14.4-linux-amd64"
+printf '#!/bin/sh\necho "sing-box version 1.14.4"\n' >"$WORK/archive/sing-box-1.14.4-linux-amd64/sing-box"
+tar -czf "$WORK/release.tar.gz" -C "$WORK/archive" .
+SHA=$(sha256sum "$WORK/release.tar.gz" | awk '{print $1}')
+make_release() {
+  python3 - "$WORK/release.json" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], "w") as fh:
+    json.dump({"tag_name":"v1.14.4", "body":"x"*350000, "assets":[{"name":"sing-box-1.14.4-linux-amd64.tar.gz",
+        "browser_download_url":"https://example.invalid/archive", "digest":sys.argv[2]}]}, fh)
+PY
+}
+detect_arch() { echo amd64; }
+curl() {
+  case "$*" in
+    *api.github.com*) cp "$WORK/release.json" "${!#}" ;;
+    *example.invalid/archive*) cp "$WORK/release.tar.gz" "${!#}" ;;
+    *) fail "unexpected HTTP request" ;;
+  esac
+}
+make_release "sha256:$SHA"
+echo original >"$SB_BIN"
+chmod 755 "$SB_BIN"
+install_singbox_binary v1.14.4
+[[ "$("$SB_BIN" version)" == "sing-box version 1.14.4" && "$(cat "${SB_BIN}.bak")" == original ]] || fail "install did not retain rollback core"
+restore_singbox_binary
+for invalid in "" "sha256:invalid" "sha256:$(printf '%064d' 0)"; do
+  make_release "$invalid"
+  if (trap - EXIT; install_singbox_binary v1.14.4) >/dev/null 2>&1; then fail "accepted invalid digest"; fi
+  [[ "$(cat "$SB_BIN")" == original ]] || fail "unverified core published"
+done
+
+set_paths native
+mkdir -p "$SB_DIR"; echo native >"$SB_CONFIG"
+: >"$WORK/systemctl.calls"
+if (trap - EXIT; cmd_uninstall) >/dev/null 2>&1; then fail "uninstall accepted unmanaged instance"; fi
+[[ "$(cat "$SB_CONFIG")" == native && ! -s "$WORK/systemctl.calls" ]] || fail "unmanaged service touched"
+if (trap - EXIT; cp() { return 1; }; backup_existing_singbox) >/dev/null 2>&1; then fail "ignored backup failure"; fi
+[[ ! -e "$SB_DIR/.managed-by-sb-kit" ]] || fail "claimed failed backup"
+
+# Refuse external storage roots before taking ownership; read-only certificate
+# links and replaceable config/unit/logrotate file links can be round-tripped.
+set_paths links
+mkdir -p "${SB_DIR%/*}" "$WORK/external"; echo untouched >"$WORK/external/keep"
+for dir in "$SB_DIR" "$SB_LOG_DIR" "$SB_STATE_DIR"; do
+  ln -s "$WORK/external" "$dir"
+  if (trap - EXIT; backup_existing_singbox) >/dev/null 2>&1; then fail "accepted linked storage $dir"; fi
+  [[ ! -e "$SB_BACKUP_ROOT" && "$(cat "$dir/keep")" == untouched ]] || fail "modified linked storage"
+  rm "$dir"
+done
+mkdir -p "$SB_DIR" "$SB_STATE_DIR/certs" "$SB_STATE_DIR/acme"
+ln -s "$WORK/external" "$SB_STATE_DIR/acme/certificates"
+if (trap - EXIT; backup_existing_singbox) >/dev/null 2>&1; then fail "accepted externally writable ACME store"; fi
+rm "$SB_STATE_DIR/acme/certificates"
+echo cert >"$WORK/external/site.key"; chmod 600 "$WORK/external/site.key"
+ln -s "$WORK/external/site.key" "$SB_STATE_DIR/certs/site.key"
+for path in "$SB_UNIT" "$SB_LOGROTATE" "$SB_CONFIG"; do
+  ln -s "$WORK/external/keep" "$path"
+done
+backup_existing_singbox
+ensure_singbox_system
+ensure_base_config 0
+fix_runtime_perms
+[[ ! -L "$SB_UNIT" && ! -L "$SB_LOGROTATE" && ! -L "$SB_CONFIG" ]] || fail "overwrote link destination"
+cmd_uninstall --keep-tcpfit
+for path in "$SB_UNIT" "$SB_LOGROTATE" "$SB_CONFIG"; do
+  [[ -L "$path" && "$(cat "$path")" == untouched ]] || fail "failed to restore link $path"
+done
+[[ -L "$SB_STATE_DIR/certs/site.key" ]] || fail "removed a custom certificate link"
+python3 - "$WORK/external/site.key" <<'PY'
+import os, stat, sys
+assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600
+PY
+
+# Adopt an existing unit/binary/config and round-trip its original state.
+set_paths native
+echo native-core >"$SB_BIN"; echo native-unit >"$SB_UNIT"; echo native-rotate >"$SB_LOGROTATE"
+mkdir -p "$SB_STATE_DIR"; touch "$SB_STATE_DIR/operator.db"
+chmod 751 "$SB_DIR"; chmod 710 "$SB_STATE_DIR"; chmod 604 "$SB_STATE_DIR/operator.db"
+touch "$WORK/is-active" "$WORK/is-enabled"
+printf '%s\n' "$SB_UNIT" >"$WORK/fragment"
+backup_existing_singbox
+[[ -f "$SB_BACKUP_ROOT/$PRE_INSTALL_BACKUP/complete" ]] || fail "missing completed backup"
+ensure_singbox_system
+chmod 600 "$SB_STATE_DIR/operator.db"
+echo kit-core >"$SB_BIN"; echo kit-config >"$SB_CONFIG"; echo native-extra >"$SB_CONF_DIR/handmade.json"
+mkdir -p "$SB_STATE_DIR/certs/identity-test" "$SB_LIB_DST" "$NFT_DIR"
+touch "$SB_STATE_DIR/certs/identity-test"/{.managed-by-sb-kit,certificate.crt,private.key}
+touch "$SB_STATE_DIR/certs/external.key" "$SB_LIB_DST/external" "$SB_LOG_DIR/foreign.log"
+printf '{"tag":"socks-1234","proto":"socks","port":1234}\n' >"$SB_META_DIR/socks-1234.json"
+printf '{"inbounds":[{"tag":"socks-1234"}]}\n' >"$SB_CONF_DIR/socks-1234.json"
+cmd_uninstall
+[[ "$(cat "$SB_BIN")" == native-core && "$(cat "$SB_CONFIG")" == native && "$(cat "$SB_UNIT")" == native-unit ]] || fail "native files not restored"
+[[ "$(cat "$SB_LOGROTATE")" == native-rotate && -e "$SB_CONF_DIR/handmade.json" ]] || fail "native data damaged"
+[[ -f "$SB_STATE_DIR/certs/external.key" && -f "$SB_LIB_DST/external" && -f "$SB_LOG_DIR/foreign.log" ]] || fail "foreign files removed"
+[[ ! -e "$SB_CONF_DIR/socks-1234.json" && ! -e "$SB_STATE_DIR/certs/identity-test" ]] || fail "owned files remain"
+python3 - "$SB_DIR" "$SB_STATE_DIR" "$SB_STATE_DIR/operator.db" <<'PY'
+import os, stat, sys
+assert [stat.S_IMODE(os.stat(p).st_mode) for p in sys.argv[1:]] == [0o751, 0o710, 0o604]
+PY
+grep -Fxq 'start sing-box' "$WORK/systemctl.calls" || fail "native service was not restarted"
+
+set_paths missing
+ensure_singbox_system
+printf 'sb-kit-v1\npre-install-missing\n' >"$SB_DIR/.managed-by-sb-kit"
+echo still-running >"$SB_CONFIG"
+: >"$WORK/systemctl.calls"
+if (trap - EXIT; cmd_uninstall) >/dev/null 2>&1; then fail "uninstalled without original backup"; fi
+[[ "$(cat "$SB_CONFIG")" == still-running ]] || fail "missing backup damaged state"
+if grep -q '^disable' "$WORK/systemctl.calls"; then fail "stopped service before backup check"; fi
+
+set_paths legacy
+ensure_singbox_system
+: >"$SB_DIR/.managed-by-sb-kit"
+echo shared >"$SB_STATE_DIR/operator.db"
+cmd_uninstall --keep-tcpfit
+[[ "$(cat "$SB_STATE_DIR/operator.db")" == shared && ! -e "$SB_UNIT" ]] || fail "legacy marker handling"
+
+set_paths fresh
+backup_existing_singbox
+ensure_singbox_system
+echo config >"$SB_CONFIG"; touch "$SB_LOG_DIR/error.log" "$SB_LOG_DIR/error.log.1.gz"
+mkdir -p "$SB_STATE_DIR/acme/certificates/test-ca/site.test"
+touch "$SB_STATE_DIR/acme/certificates/test-ca/site.test/site.test.crt"
+cmd_uninstall
+for dir in "$SB_DIR" "$SB_STATE_DIR" "$SB_LOG_DIR"; do [[ ! -e "$dir" ]] || fail "retained $dir"; done
+echo "install/uninstall safety OK"
