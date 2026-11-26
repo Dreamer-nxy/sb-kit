@@ -10,7 +10,7 @@
 set -euo pipefail
 umask 022
 
-SBKIT_VERSION="0.2.2"
+SBKIT_VERSION="0.3.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LIB_DIR="${SCRIPT_DIR}/lib"
@@ -55,7 +55,10 @@ TCPFIT_VERSION="v0.5.9"
 TCPFIT_URL="https://raw.githubusercontent.com/Kylin010/tcpfit/${TCPFIT_VERSION}/tcpfit.sh"
 TCPFIT_SHA256="8331cc40950229a3280ce32406330a85b1a3d21ba398a4db3dc7e25c39783741"
 
-GEOIP_CN_SRS_URL="https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs"
+GEOSITE_COMMIT_API="https://api.github.com/repos/SagerNet/sing-geosite/commits/rule-set"
+SB_ROUTE_STATE_NAME="route-state.json"
+SB_ALLOW_LIST_NAME="cn-allow.list"
+SB_BLOCK_LIST_NAME="cn-block.list"
 
 if [[ -t 1 ]]; then
   C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'
@@ -458,31 +461,273 @@ EOF
   systemctl enable sing-box >/dev/null 2>&1 || true
 }
 
-ensure_base_config() {
-  local block_cn="${1:-0}"
-  local cn_srs=""
-  if [[ "$block_cn" == "1" ]]; then
-    cn_srs="${SB_RULES_DIR}/geoip-cn.srs"
-    info "下载 geoip-cn.srs 规则集..."
-    local cn_tmp
-    cn_tmp=$(mktemp "${SB_RULES_DIR}/.geoip-cn.XXXXXX") || die "创建规则临时文件失败"
-    CLEANUP_PATHS+=("$cn_tmp")
-    curl -fsSL --max-time 30 "$GEOIP_CN_SRS_URL" -o "$cn_tmp" || die "下载 geoip-cn.srs 失败"
-    mv -f "$cn_tmp" "$cn_srs" || die "写入 geoip-cn.srs 失败"
-    chown root:"$SB_GROUP" "$cn_srs"
-    chmod 640 "$cn_srs"
+valid_cn_mode() {
+  case "${1:-}" in
+    off|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+current_cn_mode() {
+  local state_file="${SB_RULES_DIR}/${SB_ROUTE_STATE_NAME}" mode=""
+  if [[ -f "$state_file" && ! -L "$state_file" ]]; then
+    mode=$(python3 "${LIB_DIR}/config_gen.py" route-state --file "$state_file" get 2>/dev/null | awk -F= '$1=="MODE"{print $2; exit}')
+  fi
+  if valid_cn_mode "$mode"; then
+    echo "$mode"
+    return 0
+  fi
+  if [[ -f "$SB_CONFIG" ]] && grep -q '"geosite-category-netdisk-cn"' "$SB_CONFIG" 2>/dev/null; then
+    echo "on"
+    return 0
+  fi
+  echo "off"
+}
+
+fetch_rule_commit() {
+  local url="$1" sha=""
+  sha=$(curl -fsSL --connect-timeout 5 --max-time 8 -H 'Accept: application/vnd.github.sha' "$url" 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "${sha:0:12}"
+  fi
+}
+
+download_rules_for_mode() {
+  local mode="$1" dest_dir="$2" refresh="${3:-0}"
+  local plan_out filename url live_file
+  plan_out=$(python3 "${LIB_DIR}/config_gen.py" route-plan --mode "$mode") || return 1
+  [[ -n "$plan_out" ]] || return 0
+
+  local -a dl_files=() dl_urls=()
+  while IFS='|' read -r _ filename url; do
+    [[ -n "$filename" ]] || continue
+    live_file="${SB_RULES_DIR}/${filename}"
+    if [[ "$refresh" != "1" && -f "$live_file" && ! -L "$live_file" && -s "$live_file" ]]; then
+      cp -f "$live_file" "${dest_dir}/${filename}" || return 1
+    else
+      dl_files+=("$filename")
+      dl_urls+=("$url")
+    fi
+  done <<< "$plan_out"
+
+  if [[ ${#dl_files[@]} -gt 0 ]]; then
+    local total=${#dl_files[@]} i=0 max_jobs=6 failed=0
+    local -a pids=()
+    info "下载回国阻断规则集（${total} 个 .srs 文件）..."
+    for ((i = 0; i < total; i++)); do
+      filename="${dl_files[$i]}"
+      url="${dl_urls[$i]}"
+      (
+        download_release_file "$url" "${dest_dir}/${filename}.part" 30 &&
+          [[ -s "${dest_dir}/${filename}.part" ]] &&
+          mv -f "${dest_dir}/${filename}.part" "${dest_dir}/${filename}"
+      ) &
+      pids+=("$!")
+      if [[ ${#pids[@]} -ge "$max_jobs" ]]; then
+        wait "${pids[0]}" || failed=1
+        pids=("${pids[@]:1}")
+      fi
+    done
+    local pid
+    for pid in ${pids[@]+"${pids[@]}"}; do
+      wait "$pid" || failed=1
+    done
+    if [[ "$failed" -ne 0 ]]; then
+      warn "规则集下载未全部成功，已中止本次更新（原配置未改动）"
+      return 1
+    fi
   fi
 
-  local tmpcfg
-  tmpcfg=$(mktemp "${SB_DIR}/.config.json.XXXXXX")
-  python3 "${LIB_DIR}/config_gen.py" base-config \
-    --out "$tmpcfg" \
-    --log-file "${SB_LOG_DIR}/error.log" \
-    ${cn_srs:+--cn-srs "$cn_srs"}
-  chown root:"$SB_GROUP" "$tmpcfg"
-  chmod 640 "$tmpcfg"
-  mv -f "$tmpcfg" "$SB_CONFIG"
-  ok "基础配置与安全路由已写入: ${SB_CONFIG}（回国阻断: $([[ "$block_cn" == "1" ]] && echo 开启 || echo 关闭)）"
+  local f
+  for f in "$dest_dir"/*.srs; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    chown root:"$SB_GROUP" "$f"
+    chmod 640 "$f"
+  done
+  return 0
+}
+
+sync_rules_update_timer() {
+  local mode="$1" unit_dir="${SB_UNIT%/*}" svc tmr
+  svc="${unit_dir}/sbkit-rules-update.service"
+  tmr="${unit_dir}/sbkit-rules-update.timer"
+
+  if [[ "$mode" == "off" ]]; then
+    if [[ -f "$tmr" && ! -L "$tmr" ]] && grep -Fxq 'Description=sb-kit weekly CN route rules update timer' "$tmr"; then
+      systemctl disable --now sbkit-rules-update.timer >/dev/null 2>&1 || true
+      rm -f "$tmr" || return 1
+    fi
+    if [[ -f "$svc" && ! -L "$svc" ]] && grep -Fxq 'Description=sb-kit CN route rules auto-updater' "$svc"; then
+      rm -f "$svc" || return 1
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  [[ ! -L "$svc" && ! -L "$tmr" ]] || die "规则更新服务单元为符号链接，已中止: $unit_dir"
+  mkdir -p "$unit_dir"
+  cat >"$svc" <<EOF
+[Unit]
+Description=sb-kit CN route rules auto-updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${SB_CTL_DST} route update --quiet
+EOF
+  cat >"$tmr" <<EOF
+[Unit]
+Description=sb-kit weekly CN route rules update timer
+
+[Timer]
+OnCalendar=Sun *-*-* 06:30:00 UTC
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sbkit-rules-update.timer >/dev/null 2>&1 || true
+}
+
+ensure_base_config() {
+  local raw_mode="${1:-off}" refresh_rules="${2:-0}" quiet="${3:-0}" mode=""
+  case "$raw_mode" in
+    0|off) mode="off" ;;
+    1|on)  mode="on" ;;
+    *) die "无效回国阻断开关: ${raw_mode}（可选: on | off）" ;;
+  esac
+
+  mkdir -p "$SB_DIR" "$SB_RULES_DIR"
+  [[ ! -L "$SB_RULES_DIR" ]] || die "规则目录为符号链接，已中止: $SB_RULES_DIR"
+
+  local state_file="${SB_RULES_DIR}/${SB_ROUTE_STATE_NAME}"
+  local allow_file="${SB_RULES_DIR}/${SB_ALLOW_LIST_NAME}"
+  local block_file="${SB_RULES_DIR}/${SB_BLOCK_LIST_NAME}"
+  local p
+  for p in "$state_file" "$allow_file" "$block_file"; do
+    [[ ! -L "$p" ]] || die "规则文件为符号链接，已中止: $p"
+  done
+
+  local stage
+  stage=$(mktemp -d "${SB_DIR}/.route.XXXXXXXX") || die "无法创建路由暂存目录"
+  CLEANUP_PATHS+=("$stage")
+  mkdir -p "$stage/rules" "$stage/backup" || die "无法初始化路由暂存目录"
+  chown root:"$SB_GROUP" "$stage" "$stage/rules"
+  chmod 710 "$stage"
+  chmod 750 "$stage/rules"
+
+  local had_missing=0
+  if [[ "$mode" != "off" ]]; then
+    local plan_check fn
+    plan_check=$(python3 "${LIB_DIR}/config_gen.py" route-plan --mode "$mode") || return 1
+    while IFS='|' read -r _ fn _; do
+      [[ -n "$fn" ]] || continue
+      [[ ! -L "${SB_RULES_DIR}/${fn}" ]] || die "规则文件为符号链接，已中止: ${SB_RULES_DIR}/${fn}"
+      [[ -f "${SB_RULES_DIR}/${fn}" && -s "${SB_RULES_DIR}/${fn}" ]] || had_missing=1
+    done <<< "$plan_check"
+    download_rules_for_mode "$mode" "$stage/rules" "$refresh_rules" || return 1
+  fi
+
+  local -a common_gen=(
+    "${LIB_DIR}/config_gen.py" base-config
+    --log-file "${SB_LOG_DIR}/error.log"
+    --cn-mode "$mode"
+    --allow-file "$allow_file"
+    --block-file "$block_file"
+  )
+  python3 "${common_gen[@]}" --out "$stage/check-config.json" --rules-dir "$stage/rules" || return 1
+  python3 "${common_gen[@]}" --out "$stage/live-config.json" --rules-dir "$SB_RULES_DIR" || return 1
+  chown root:"$SB_GROUP" "$stage/check-config.json" "$stage/live-config.json"
+  chmod 640 "$stage/check-config.json" "$stage/live-config.json"
+
+  # Validate candidate rulesets & route JSON with real sing-box before touching live files.
+  if [[ -x "$SB_BIN" && -d "$SB_CONF_DIR" ]]; then
+    if ! run_as_service_user "$SB_BIN" check -c "$stage/check-config.json" -C "$SB_CONF_DIR"; then
+      warn "新路由配置或规则集未通过 sing-box check，已保留原配置"
+      return 1
+    fi
+  fi
+
+  # Snapshot live config, state & overwritten rule files for rollback on restart failure.
+  local had_cfg=0 had_state=0 was_active=0
+  if [[ -e "$SB_CONFIG" || -L "$SB_CONFIG" ]]; then
+    cp -a "$SB_CONFIG" "$stage/backup/config.json" || return 1
+    had_cfg=1
+  fi
+  if [[ -f "$state_file" ]]; then
+    cp -a "$state_file" "$stage/backup/${SB_ROUTE_STATE_NAME}" || return 1
+    had_state=1
+  fi
+  local -a installed_new=()
+  local f base
+  for f in "$stage/rules"/*.srs; do
+    [[ -f "$f" ]] || continue
+    base="${f##*/}"
+    if [[ -f "${SB_RULES_DIR}/${base}" ]]; then
+      cp -a "${SB_RULES_DIR}/${base}" "$stage/backup/${base}" || return 1
+    else
+      installed_new+=("$base")
+    fi
+  done
+
+  systemctl is-active --quiet sing-box 2>/dev/null && was_active=1
+
+  for f in "$stage/rules"/*.srs; do
+    [[ -f "$f" ]] || continue
+    base="${f##*/}"
+    mv -f "$f" "${SB_RULES_DIR}/${base}" || return 1
+    chown root:"$SB_GROUP" "${SB_RULES_DIR}/${base}"
+    chmod 640 "${SB_RULES_DIR}/${base}"
+  done
+  mv -f "$stage/live-config.json" "$SB_CONFIG" || return 1
+  chown root:"$SB_GROUP" "$SB_CONFIG"
+  chmod 640 "$SB_CONFIG"
+
+  local -a state_args=(--file "$state_file" set --mode "$mode")
+  if [[ "$mode" == "on" && ( "$refresh_rules" == "1" || "$had_missing" == "1" ) ]]; then
+    local gs_sha="" now_utc
+    gs_sha=$(fetch_rule_commit "$GEOSITE_COMMIT_API")
+    [[ -n "$gs_sha" ]] && state_args+=(--geosite-commit "$gs_sha")
+    now_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    state_args+=(--updated-at "$now_utc")
+  fi
+  python3 "${LIB_DIR}/config_gen.py" route-state "${state_args[@]}" || return 1
+  chown root:"$SB_GROUP" "$state_file"
+  chmod 640 "$state_file"
+
+  if [[ -x "$SB_BIN" ]] && compgen -G "${SB_CONF_DIR}/*.json" >/dev/null 2>&1; then
+    if ! validate_and_restart; then
+      warn "应用新路由后重启失败，正在回滚至上一套配置与规则集..."
+      if [[ "$had_cfg" == 1 ]]; then
+        mv -f "$stage/backup/config.json" "$SB_CONFIG" || true
+      else
+        rm -f "$SB_CONFIG" || true
+      fi
+      if [[ "$had_state" == 1 ]]; then
+        mv -f "$stage/backup/${SB_ROUTE_STATE_NAME}" "$state_file" || true
+      else
+        rm -f "$state_file" || true
+      fi
+      for f in "$stage/backup"/*.srs; do
+        [[ -f "$f" ]] || continue
+        mv -f "$f" "${SB_RULES_DIR}/${f##*/}" || true
+      done
+      for base in ${installed_new[@]+"${installed_new[@]}"}; do
+        rm -f "${SB_RULES_DIR}/${base}" || true
+      done
+      restore_node_service "$was_active" || true
+      return 1
+    fi
+  fi
+
+  sync_rules_update_timer "$mode"
+  rm -rf "$stage"
+  if [[ "$quiet" != "1" ]]; then
+    ok "基础配置与安全路由已写入: ${SB_CONFIG}（回国阻断: $([[ "$mode" == "on" ]] && echo 开启 || echo 关闭)）"
+  fi
 }
 
 fix_runtime_perms() {
@@ -491,6 +736,14 @@ fix_runtime_perms() {
   [[ -d "$SB_CONF_DIR" ]] && {
     find "$SB_CONF_DIR" -maxdepth 1 -type f -name '*.json' -exec chown root:"$SB_GROUP" {} + -exec chmod 640 {} +
   }
+  if [[ -d "$SB_RULES_DIR" ]]; then
+    local rf
+    for rf in "$SB_RULES_DIR"/*.srs "$SB_RULES_DIR"/*.json "$SB_RULES_DIR"/*.list; do
+      [[ -f "$rf" && ! -L "$rf" ]] || continue
+      chown root:"$SB_GROUP" "$rf"
+      chmod 640 "$rf"
+    done
+  fi
   [[ -d "$SB_META_DIR" ]] && {
     find "$SB_META_DIR" -maxdepth 1 -type f -name '*.json' -exec chown root:root {} + -exec chmod 600 {} +
   }
@@ -1368,33 +1621,150 @@ cmd_del() {
   ok "已删除节点: ${target}"
 }
 
+route_help() {
+  cat <<'EOF'
+用法:
+  sbctl route [status]                  查看回国阻断状态、规则集版本与自定义名单
+  sbctl route block-cn-on | on          开启回国阻断（杜甫 v2fly 精准方案 + 每周自动更新）
+  sbctl route block-cn-off | off        关闭回国阻断（仅拦截内网/25端口/BT）
+  sbctl route update [--quiet]          立即更新并校验本地规则集（失败保留旧规则）
+  sbctl route allow <list|add|del> [域名]
+                                        查看 / 增删自定义放行域名后缀（最高优先级）
+  sbctl route block <list|add|del> [域名]
+                                        查看 / 增删自定义拦截域名后缀
+EOF
+}
+
 cmd_route() {
-  [[ $# -le 1 ]] || die "用法: sbctl route [status|block-cn-on|block-cn-off]"
   local action="${1:-status}"
+  if [[ $# -gt 0 ]]; then shift; fi
+
   case "$action" in
-    block-cn-on|block-cn-off)
-      need_root
-      acquire_lock
-      local enabled=0
-      [[ "$action" == block-cn-on ]] && enabled=1
-      ensure_base_config "$enabled" || return 1
-      if compgen -G "${SB_CONF_DIR}/*.json" >/dev/null; then validate_and_restart; fi
+    -h|--help|help)
+      route_help
+      return 0
       ;;
     status)
+      [[ $# -eq 0 ]] || die "用法: sbctl route [status]"
       need_root
-      if [[ -f "$SB_CONFIG" ]] && grep -q '"geoip-cn"' "$SB_CONFIG"; then
-        ok "当前回国 IP 阻断: 已开启（geoip-cn）"
-      else
-        info "当前回国 IP 阻断: 已关闭"
+      local mode state_file allow_file block_file st_out gs_sha updated
+      local allow_cnt=0 block_cnt=0 srs_cnt=0 timer_state="未启用"
+      mode=$(current_cn_mode)
+      state_file="${SB_RULES_DIR}/${SB_ROUTE_STATE_NAME}"
+      allow_file="${SB_RULES_DIR}/${SB_ALLOW_LIST_NAME}"
+      block_file="${SB_RULES_DIR}/${SB_BLOCK_LIST_NAME}"
+      if [[ -f "$state_file" && ! -L "$state_file" ]]; then
+        st_out=$(python3 "${LIB_DIR}/config_gen.py" route-state --file "$state_file" get 2>/dev/null || true)
+        gs_sha=$(awk -F= '$1=="GEOSITE_COMMIT"{print $2; exit}' <<<"$st_out")
+        updated=$(awk -F= '$1=="UPDATED_AT"{print $2; exit}' <<<"$st_out")
       fi
+      if [[ -f "$allow_file" ]]; then
+        allow_cnt=$(python3 "${LIB_DIR}/config_gen.py" route-domains --file "$allow_file" list 2>/dev/null | wc -l | tr -d '[:space:]')
+      fi
+      if [[ -f "$block_file" ]]; then
+        block_cnt=$(python3 "${LIB_DIR}/config_gen.py" route-domains --file "$block_file" list 2>/dev/null | wc -l | tr -d '[:space:]')
+      fi
+      if [[ "$mode" == "on" ]]; then
+        srs_cnt=$(python3 "${LIB_DIR}/config_gen.py" route-plan --mode on | wc -l | tr -d '[:space:]')
+        if systemctl is-active --quiet sbkit-rules-update.timer 2>/dev/null || systemctl is-enabled --quiet sbkit-rules-update.timer 2>/dev/null; then
+          timer_state="已启用（每周日 14:30 CST）"
+        fi
+        ok "当前回国阻断: 已开启（v2fly 精准分类 ${srs_cnt} 个 + 显式补充，不误伤指纹浏览器/飞书/1688）"
+        printf '  规则集版本: geosite=%s | 更新时间: %s\n' "${gs_sha:-未知}" "${updated:-未知}"
+        printf '  自动更新定时器: %s\n' "$timer_state"
+      else
+        info "当前回国阻断: 已关闭（仅拦截内网/25端口/BT）"
+      fi
+      printf '  自定义名单: 放行 %s 条 (%s) | 拦截 %s 条 (%s)\n' \
+        "$allow_cnt" "$allow_file" "$block_cnt" "$block_file"
       ;;
-    *) die "未知路由操作: $action" ;;
+    block-cn-on|on)
+      [[ $# -eq 0 ]] || die "用法: sbctl route block-cn-on"
+      need_root
+      acquire_lock
+      ensure_base_config on 0 0 || return 1
+      ;;
+    block-cn-off|off)
+      [[ $# -eq 0 ]] || die "用法: sbctl route block-cn-off"
+      need_root
+      acquire_lock
+      ensure_base_config off 0 0 || return 1
+      ;;
+    update)
+      local quiet=0
+      if [[ $# -eq 1 && "$1" == "--quiet" ]]; then
+        quiet=1
+      elif [[ $# -ne 0 ]]; then
+        die "用法: sbctl route update [--quiet]"
+      fi
+      need_root
+      acquire_lock
+      if [[ "$(current_cn_mode)" != "on" ]]; then
+        [[ "$quiet" == "1" ]] || info "当前回国阻断未开启，无需更新规则集"
+        return 0
+      fi
+      ensure_base_config on 1 "$quiet" || return 1
+      ;;
+    allow|block)
+      [[ $# -ge 1 && $# -le 2 ]] || die "用法: sbctl route ${action} <list|add|del> [域名]"
+      local op="$1" domain="${2:-}" list_file
+      if [[ "$action" == "allow" ]]; then
+        list_file="${SB_RULES_DIR}/${SB_ALLOW_LIST_NAME}"
+      else
+        list_file="${SB_RULES_DIR}/${SB_BLOCK_LIST_NAME}"
+      fi
+      case "$op" in
+        list)
+          [[ $# -eq 1 ]] || die "用法: sbctl route ${action} list"
+          need_root
+          local entries
+          entries=$(python3 "${LIB_DIR}/config_gen.py" route-domains --file "$list_file" list) || return 1
+          if [[ -n "$entries" ]]; then
+            printf '%s\n' "$entries"
+          else
+            info "(${action} 自定义名单为空)"
+          fi
+          ;;
+        add|del)
+          [[ $# -eq 2 && -n "$domain" ]] || die "用法: sbctl route ${action} ${op} <域名>"
+          need_root
+          acquire_lock
+          mkdir -p "$SB_RULES_DIR"
+          [[ ! -L "$list_file" ]] || die "名单文件为符号链接，已中止: $list_file"
+          local bk_list="" had_list=0
+          if [[ -f "$list_file" ]]; then
+            bk_list=$(mktemp "${SB_RULES_DIR}/.${action}.bak.XXXXXX") || return 1
+            CLEANUP_PATHS+=("$bk_list")
+            cp -a "$list_file" "$bk_list" || return 1
+            had_list=1
+          fi
+          python3 "${LIB_DIR}/config_gen.py" route-domains --file "$list_file" "$op" "$domain" || return 1
+          chown root:"$SB_GROUP" "$list_file"
+          chmod 640 "$list_file"
+          if [[ "$(current_cn_mode)" == "on" ]]; then
+            if ! ensure_base_config on 0 0; then
+              if [[ "$had_list" == "1" ]]; then
+                mv -f "$bk_list" "$list_file" || true
+              else
+                rm -f "$list_file" || true
+              fi
+              return 1
+            fi
+          else
+            ok "已更新自定义 ${action} 名单（开启回国阻断后立即生效）"
+          fi
+          if [[ -n "$bk_list" ]]; then rm -f "$bk_list"; fi
+          ;;
+        *) die "用法: sbctl route ${action} <list|add|del> [域名]" ;;
+      esac
+      ;;
+    *) die "未知路由操作: ${action}（运行 sbctl route --help 查看用法）" ;;
   esac
 }
 
 cmd_install() {
   local sb_ver="latest" proto="vless-reality" port="" sni="" domain="" ip=""
-  local block_cn=0 do_tune=1 bw="500" rtt="auto" swap_size="auto"
+  local cn_mode="off" do_tune=1 bw="500" rtt="auto" swap_size="auto"
   local non_interactive=0 skip_cn=0
 
   while [[ $# -gt 0 ]]; do
@@ -1405,7 +1775,7 @@ cmd_install() {
       --sni)             sni="$2"; shift 2 ;;
       --domain)          domain="$2"; shift 2 ;;
       --ip)              ip="$2"; shift 2 ;;
-      --block-cn)        block_cn=1; shift ;;
+      --block-cn)        cn_mode="on"; shift ;;
       --no-tune)         do_tune=0; shift ;;
       --bw)              bw="$2"; shift 2 ;;
       --rtt)             rtt="$2"; shift 2 ;;
@@ -1437,7 +1807,7 @@ cmd_install() {
   install_self
   install_singbox_binary "$sb_ver"
   ensure_singbox_system
-  ensure_base_config "$block_cn"
+  ensure_base_config "$cn_mode" 0 0
 
   if [[ "$do_tune" -eq 1 ]]; then
     local -a tune_args=(--bw "$bw" --rtt "$rtt")
@@ -1514,14 +1884,41 @@ cmd_regen() (
     tag=$(basename "$node_file")
     chown root:"$SB_GROUP" "$stage/conf/$tag" || die "无法设置节点配置权限"
   done
-  run_as_service_user "$SB_BIN" check -c "$SB_CONFIG" -C "$stage/conf" || die "候选配置校验失败，原配置仍在使用"
+  local check_base="$SB_CONFIG" has_route_candidate=0
+  if [[ -f "${SB_RULES_DIR}/${SB_ROUTE_STATE_NAME}" && ! -L "${SB_RULES_DIR}/${SB_ROUTE_STATE_NAME}" ]]; then
+    local route_mode
+    route_mode=$(current_cn_mode)
+    python3 "${LIB_DIR}/config_gen.py" base-config \
+      --out "$stage/config.json" \
+      --log-file "${SB_LOG_DIR}/error.log" \
+      --cn-mode "$route_mode" \
+      --rules-dir "$SB_RULES_DIR" \
+      --allow-file "${SB_RULES_DIR}/${SB_ALLOW_LIST_NAME}" \
+      --block-file "${SB_RULES_DIR}/${SB_BLOCK_LIST_NAME}" || die "路由基础配置重建失败，原配置仍在使用"
+    chown root:"$SB_GROUP" "$stage/config.json" && chmod 640 "$stage/config.json" || die "无法设置基础配置权限"
+    check_base="$stage/config.json"
+    has_route_candidate=1
+  fi
+  run_as_service_user "$SB_BIN" check -c "$check_base" -C "$stage/conf" || die "候选配置校验失败，原配置仍在使用"
   sync_legacy_whitelists || die "现有白名单未能生效，原配置仍在使用"
 
   systemctl is-active --quiet sing-box && was_active=1
   keep_stage=1
+  if [[ "$has_route_candidate" == 1 && -f "$SB_CONFIG" ]]; then
+    cp -a "$SB_CONFIG" "$stage/orig-config.json" || die "无法备份原基础配置"
+  fi
   exchange_regen_dirs "$stage" || die "切换重建配置失败"
+  if [[ "$has_route_candidate" == 1 ]]; then
+    mv -f "$stage/config.json" "$SB_CONFIG" || {
+      exchange_regen_dirs "$stage" || true
+      die "切换基础配置失败"
+    }
+  fi
   if ! validate_and_restart; then
     exchange_regen_dirs "$stage" || die "恢复原配置失败"
+    if [[ "$has_route_candidate" == 1 && -f "$stage/orig-config.json" ]]; then
+      mv -f "$stage/orig-config.json" "$SB_CONFIG" || die "恢复原基础配置失败"
+    fi
     if [[ "$was_active" == 1 ]]; then
       validate_and_restart || die "原配置已恢复，服务重启失败"
     else
@@ -1619,8 +2016,17 @@ cmd_uninstall() {
       nft delete table inet "$name" || die "移除运行中的规则 $name 失败"
     fi
   done
-  local -a destinations=("$SB_CONFIG" "$SB_RULES_DIR/geoip-cn.srs" "$SB_UNIT" "$SB_LOGROTATE" "$SB_BIN" "${SB_BIN}.bak")
-  local -a sources=(etc-sing-box/config.json etc-sing-box/rules/geoip-cn.srs local.service logrotate sing-box previous-core-backup)
+  if [[ -f "${unit_dir}/sbkit-rules-update.timer" && ! -L "${unit_dir}/sbkit-rules-update.timer" ]] &&
+     grep -Fxq 'Description=sb-kit weekly CN route rules update timer' "${unit_dir}/sbkit-rules-update.timer"; then
+    systemctl disable --now sbkit-rules-update.timer >/dev/null 2>&1 || true
+    rm -f "${unit_dir}/sbkit-rules-update.timer" || die "删除规则更新定时器失败"
+  fi
+  if [[ -f "${unit_dir}/sbkit-rules-update.service" && ! -L "${unit_dir}/sbkit-rules-update.service" ]] &&
+     grep -Fxq 'Description=sb-kit CN route rules auto-updater' "${unit_dir}/sbkit-rules-update.service"; then
+    rm -f "${unit_dir}/sbkit-rules-update.service" || die "删除规则更新服务失败"
+  fi
+  local -a destinations=("$SB_CONFIG" "$SB_UNIT" "$SB_LOGROTATE" "$SB_BIN" "${SB_BIN}.bak")
+  local -a sources=(etc-sing-box/config.json local.service logrotate sing-box previous-core-backup)
   local i original target
   for i in "${!destinations[@]}"; do
     target="${destinations[$i]}"
@@ -1675,7 +2081,8 @@ sbctl (sb-kit ${SBKIT_VERSION}) — 纯 sing-box + tcpfit 精简管理工具（�
   sbctl yaml                        按需导出 Clash/Mihomo proxies YAML 片段
   sbctl del [tag]                   删除节点
   sbctl tune [--bw N --rtt auto]    BBR/TCP 调优（支持 --rollback）
-  sbctl route [block-cn-on|off]     开启/关闭回国 IP 阻断
+  sbctl route [status|block-cn-on|off|update|allow|block]
+                                    回国阻断开关（v2fly 精准方案）与规则更新
   sbctl audit                       一键只读安全巡检
   sbctl update [ver]                仅升级 sing-box 核心（SHA-256 校验，失败自动回滚）
   sbctl regen                       按当前 sing-box 版本语法从 meta 重建全部入站配置
@@ -1706,7 +2113,7 @@ menu_system_action() (
 
 interactive_menu() {
   while true; do
-    local ver status user_now cc_algo qdisc mem_mb initcwnd node_count node_list
+    local ver status user_now cc_algo qdisc mem_mb initcwnd node_count node_list route_mode
     ver=$(sb_version)
     ver="${ver:-未安装}"
     if systemctl is-active --quiet sing-box 2>/dev/null; then
@@ -1720,6 +2127,7 @@ interactive_menu() {
     mem_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo "?")
     initcwnd=$(ip -4 route show default 2>/dev/null | grep -oE 'initcwnd [0-9]+' | awk '{print $2}' | head -n1 || true)
     initcwnd="${initcwnd:-默认}"
+    route_mode=$(current_cn_mode 2>/dev/null || echo "off")
 
     node_count=0
     node_list=""
@@ -1737,7 +2145,7 @@ interactive_menu() {
     printf '%b├──────────────────────────────────────────────────────────────┤%b\n' "$C_CYAN" "$C_NC"
     printf '  核心: %-12s %b  |  用户: %s\n' "$ver" "$status" "${user_now:-root}"
     printf '  网络: %s + %s  |  initcwnd: %s  |  内存: %s MB\n' "$cc_algo" "$qdisc" "$initcwnd" "$mem_mb"
-    printf '  节点: %d 个 %s\n' "$node_count" "${node_list:+(${node_list})}"
+    printf '  路由: 回国阻断 %-6s     |  节点: %d 个 %s\n' "$([[ "$route_mode" == "on" ]] && echo 开启 || echo 关闭)" "$node_count" "${node_list:+(${node_list})}"
     printf '%b├──────────────────────────────────────────────────────────────┤%b\n' "$C_CYAN" "$C_NC"
     printf '  [1]  一键安装（sing-box + 自动 BBR 调优 + 首个节点）\n'
     printf '  [2]  添加节点（VLESS-Reality / Hy2 / Naive / AnyTLS / SS / Socks）\n'
@@ -1746,7 +2154,7 @@ interactive_menu() {
     printf '  [5]  删除节点\n'
     printf '  %b──────────────────────────────────────────────────────────%b\n' "$C_DIM" "$C_NC"
     printf '  [6]  BBR / TCP 调优（自动调优 / 重调 / tcpfit 菜单 / 回滚）\n'
-    printf '  [7]  路由开关（开启 / 关闭回国 IP 阻断）\n'
+    printf '  [7]  路由与回国阻断（开启 / 关闭 / 更新规则 / 自定义放行或拦截）\n'
     printf '  [8]  服务管理（启动 / 停止 / 重启 / 查看错误日志）\n'
     printf '  [9]  一键安全巡检 (audit)\n'
     printf '  [10] 核心升级 / 重建配置（update 自动回滚 / regen 跨版本同步）\n'
@@ -1767,8 +2175,8 @@ interactive_menu() {
         else
           args+=(--bw "$bw" --rtt auto)
         fi
-        read -rp "是否开启回国 IP 阻断 (geoip:cn)? [y/N]: " block_cn
-        [[ "${block_cn:-n}" =~ ^[Yy]$ ]] && args+=(--block-cn)
+        read -rp "是否开启回国阻断（拦影音/网盘/社交/银行/PT，放行指纹浏览器/飞书/1688）? [Y/n]: " block_cn
+        [[ "${block_cn:-y}" =~ ^[Yy]$ ]] && args+=(--block-cn)
         menu_command install "${args[@]}"
         ;;
       2)
@@ -1814,10 +2222,24 @@ interactive_menu() {
         ;;
       7)
         cmd_route status
-        local ra=""
-        read -rp "1=开启回国阻断  2=关闭回国阻断 [回车取消]: " ra
-        [[ "$ra" == "1" ]] && menu_command route block-cn-on
-        [[ "$ra" == "2" ]] && menu_command route block-cn-off
+        printf '  1) 开启回国阻断  2) 关闭回国阻断  3) 立即更新规则集  4) 添加放行域名  5) 添加拦截域名\n'
+        local ra="" dom=""
+        read -rp "请选择 [1-5，回车取消]: " ra
+        case "$ra" in
+          1) menu_command route block-cn-on ;;
+          2) menu_command route block-cn-off ;;
+          3) menu_command route update ;;
+          4)
+            read -rp "请输入要放行的域名后缀（如 example.cn）: " dom
+            [[ -n "$dom" ]] && menu_command route allow add "$dom"
+            ;;
+          5)
+            read -rp "请输入要拦截的域名后缀（如 example.com）: " dom
+            [[ -n "$dom" ]] && menu_command route block add "$dom"
+            ;;
+          "") ;;
+          *) warn "无效选择" ;;
+        esac
         ;;
       8)
         printf '  1) 启动  2) 停止  3) 重启  4) 查看最近 30 行错误日志\n'
@@ -1877,7 +2299,8 @@ main() (
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     case "$sub" in
       add) cmd_add vless-reality "$1"; return ;;
-      route|del|rm|sync|regen|update|up|uninstall|audit|check|links|link|url|yaml|clash)
+      route) route_help; return ;;
+      del|rm|sync|regen|update|up|uninstall|audit|check|links|link|url|yaml|clash)
         show_help; return ;;
     esac
   fi

@@ -70,7 +70,73 @@ class TestSbKitConfigGen(unittest.TestCase):
         run_gen("base-config", "--out", str(out_cn), "--cn-srs", "/etc/sing-box/rules/geoip-cn.srs")
         cfg_cn = json.loads(out_cn.read_text(encoding="utf-8"))
         self.assertEqual(cfg_cn["route"]["rule_set"][0]["tag"], "geoip-cn")
-        self.assertTrue(any(r.get("rule_set") == ["geoip-cn"] for r in cfg_cn["route"]["rules"]))
+        rules_cn = cfg_cn["route"]["rules"]
+        resolve_idx = next(i for i, r in enumerate(rules_cn) if r.get("action") == "resolve")
+        geoip_idx = next(i for i, r in enumerate(rules_cn) if r.get("rule_set") == ["geoip-cn"])
+        self.assertLess(resolve_idx, geoip_idx)
+
+    def test_cn_route_on_off_rule_order_and_custom_lists(self) -> None:
+        rules_dir = Path(self.tmp.name) / "rules"
+        rules_dir.mkdir()
+        allow_file = rules_dir / "cn-allow.list"
+        block_file = rules_dir / "cn-block.list"
+
+        # Domain list validation & CRUD
+        run_gen("route-domains", "--file", str(allow_file), "add", ".Example.CN")
+        run_gen("route-domains", "--file", str(allow_file), "add", "example.cn")
+        run_gen("route-domains", "--file", str(block_file), "add", "bad.example.com")
+        listed = run_gen("route-domains", "--file", str(allow_file), "list").stdout.splitlines()
+        self.assertEqual(listed, ["example.cn"])
+        for bad_dom in ("http://a.com", "*.a.com", "localhost", "a b.com", "../etc"):
+            res = run_gen("route-domains", "--file", str(allow_file), "add", bad_dom, check=False)
+            self.assertNotEqual(res.returncode, 0)
+
+        # CN block ON (Dufu v2fly fine-grained policy)
+        out_on = Path(self.tmp.name) / "cn-on.json"
+        run_gen(
+            "base-config", "--out", str(out_on), "--cn-mode", "on",
+            "--rules-dir", str(rules_dir), "--allow-file", str(allow_file), "--block-file", str(block_file),
+        )
+        cfg_on = json.loads(out_on.read_text(encoding="utf-8"))
+        rs_tags = [rs["tag"] for rs in cfg_on["route"]["rule_set"]]
+        self.assertEqual(len(rs_tags), len(config_gen.CN_BLOCK_GEOSITE_TAGS))
+        self.assertIn("geosite-category-netdisk-cn", rs_tags)
+        self.assertIn("geosite-icbc", rs_tags)
+        self.assertNotIn("geoip-cn", rs_tags)
+        self.assertNotIn("geosite-cn", rs_tags)
+
+        rules_on = cfg_on["route"]["rules"]
+        self.assertFalse(any(r.get("action") == "resolve" for r in rules_on))
+        idx_user_allow = next(i for i, r in enumerate(rules_on) if r.get("domain_suffix") == ["example.cn"])
+        idx_user_block = next(i for i, r in enumerate(rules_on) if r.get("domain_suffix") == ["bad.example.com"])
+        idx_builtin_allow = next(
+            i for i, r in enumerate(rules_on)
+            if r.get("action") == "route" and "feishu.cn" in r.get("domain_suffix", [])
+        )
+        idx_rs_block = next(i for i, r in enumerate(rules_on) if "geosite-bilibili" in r.get("rule_set", []))
+        idx_extra_block = next(
+            i for i, r in enumerate(rules_on)
+            if r.get("action") == "reject" and "gov.cn" in r.get("domain_suffix", [])
+        )
+        self.assertLess(idx_user_allow, idx_user_block)
+        self.assertLess(idx_user_block, idx_builtin_allow)
+        self.assertLess(idx_builtin_allow, idx_rs_block)
+        self.assertLess(idx_rs_block, idx_extra_block)
+
+        # Route plan & route state round-trip
+        plan_on = run_gen("route-plan", "--mode", "on").stdout.splitlines()
+        self.assertEqual(len(plan_on), len(config_gen.CN_BLOCK_GEOSITE_TAGS))
+        self.assertEqual(run_gen("route-plan", "--mode", "off").stdout.strip(), "")
+        state_file = rules_dir / "route-state.json"
+        run_gen("route-state", "--file", str(state_file), "set", "--mode", "on", "--geosite-commit", "abc123def456", "--updated-at", "2026-11-26T00:00:00Z")
+        got = run_gen("route-state", "--file", str(state_file), "get").stdout
+        self.assertIn("MODE=on", got)
+        self.assertIn("GEOSITE_COMMIT=abc123def456", got)
+
+        # Remove domain works and rejects missing domain
+        run_gen("route-domains", "--file", str(allow_file), "del", "example.cn")
+        self.assertEqual(run_gen("route-domains", "--file", str(allow_file), "list").stdout.strip(), "")
+        self.assertNotEqual(run_gen("route-domains", "--file", str(allow_file), "del", "example.cn", check=False).returncode, 0)
 
     def test_vless_reality_real_x25519_perms_and_modify(self) -> None:
         res = run_gen(

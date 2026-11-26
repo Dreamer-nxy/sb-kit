@@ -161,4 +161,33 @@ mkdir -p "$SB_STATE_DIR/acme/certificates/test-ca/site.test"
 touch "$SB_STATE_DIR/acme/certificates/test-ca/site.test/site.test.crt"
 cmd_uninstall
 for dir in "$SB_DIR" "$SB_STATE_DIR" "$SB_LOG_DIR"; do [[ ! -e "$dir" ]] || fail "retained $dir"; done
+
+# Exercise targeted CN route files, timer install/disable, and selective uninstall cleanup.
+set_paths route_clean
+backup_existing_singbox
+ensure_singbox_system
+curl() {
+  local out=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o) out="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  if [[ -n "$out" ]]; then
+    printf 'DUMMY-SRS-DATA' >"$out"
+  else
+    printf '0123456789abcdef0123456789abcdef01234567\n'
+  fi
+}
+touch "$SB_RULES_DIR/operator-custom.srs"
+ensure_base_config on 1 1
+[[ -f "$SB_RULES_DIR/route-state.json" && -f "$SB_RULES_DIR/geosite-category-netdisk-cn.srs" ]] || fail "CN block rules not installed"
+[[ -f "${SB_UNIT%/*}/sbkit-rules-update.timer" && -f "${SB_UNIT%/*}/sbkit-rules-update.service" ]] || fail "rules update timer not installed"
+cmd_route allow add example.cn >/dev/null
+[[ -f "$SB_RULES_DIR/cn-allow.list" ]] || fail "custom allowlist not written"
+cmd_uninstall --keep-tcpfit
+[[ ! -e "${SB_UNIT%/*}/sbkit-rules-update.timer" && ! -e "${SB_UNIT%/*}/sbkit-rules-update.service" ]] || fail "rules update timer survived uninstall"
+[[ ! -e "$SB_RULES_DIR/geosite-category-netdisk-cn.srs" && ! -e "$SB_RULES_DIR/route-state.json" && ! -e "$SB_RULES_DIR/cn-allow.list" ]] || fail "managed route files survived uninstall"
+[[ -f "$SB_RULES_DIR/operator-custom.srs" ]] || fail "operator foreign rule file was deleted"
 echo "install/uninstall safety OK"

@@ -147,6 +147,17 @@ for port in 39187 39188; do
   [[ -n $(ss -H -lnu "sport = :$port") ]] || fail "missing Hy2 UDP listener on $port"
 done
 
+echo "== Enable CN block, custom allow/block lists, regen & timer"
+"$ctl" route block-cn-on >/dev/null
+[[ -f "$config/rules/route-state.json" && -f "$config/rules/geosite-category-netdisk-cn.srs" ]] || fail "CN block rules missing"
+systemctl is-enabled --quiet sbkit-rules-update.timer || fail "rules update timer not enabled"
+"$ctl" route allow add example.cn >/dev/null
+"$ctl" route block add blocked.example.com >/dev/null
+grep -Fq '"example.cn"' "$config/config.json" && grep -Fq '"blocked.example.com"' "$config/config.json" || fail "custom lists not rendered"
+"$ctl" regen >/dev/null
+grep -Fq '"geosite-category-netdisk-cn"' "$config/config.json" && grep -Fq '"example.cn"' "$config/config.json" || fail "regen lost CN block route config"
+systemctl is-active --quiet "$service" && listening 39182 || fail "listener lost after route/regen"
+
 echo "== Uninstall, preserve an unrelated file, refuse unmanaged uninstall"
 "$ctl" modify socks-39182 --whitelist 192.0.2.2 >/dev/null
 nft list table inet sbkit_wl_socks_39182 >/dev/null
@@ -154,6 +165,8 @@ printf '%s\n' preserve >"$config/operator-note.txt"
 "$ctl" uninstall --keep-tcpfit >/dev/null
 if listening 39182 || systemctl is-active --quiet "$service"; then fail "service survived uninstall"; fi
 [[ $(systemctl show "$service" -p LoadState --value) == not-found ]] || fail "unit survived uninstall"
+[[ $(systemctl show sbkit-rules-update.timer -p LoadState --value) == not-found ]] || fail "rules update timer survived uninstall"
+[[ ! -e "$config/rules/geosite-category-netdisk-cn.srs" && ! -e "$config/rules/route-state.json" ]] || fail "managed route rules survived uninstall"
 if nft list table inet sbkit_wl_socks_39182 >/dev/null 2>&1; then fail "uninstall left a kernel filter"; fi
 [[ ! -e "$ctl" && ! -e "$core" && ! -e "$config/config.json" && ! -e "$config/.managed-by-sb-kit" ]] || fail "managed installation remained"
 [[ ! -e /usr/local/lib/sb-kit && ! -L "$ctl" ]] || fail "synced toolkit remained after uninstall"

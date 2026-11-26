@@ -10,6 +10,7 @@ SB_DIR="$WORK/etc"
 SB_CONF_DIR="$SB_DIR/conf"
 SB_CONFIG="$SB_DIR/config.json"
 SB_META_DIR="$SB_DIR/meta"
+SB_RULES_DIR="$SB_DIR/rules"
 SB_BIN="$WORK/absent-core"
 SB_CTL_DST="$WORK/sbctl"
 SB_LOCK="$WORK/sb-kit.lock"
@@ -70,6 +71,8 @@ fi
 
 main route >/dev/null
 main route status >/dev/null
+main route allow list >/dev/null
+main route block list >/dev/null
 main audit >/dev/null
 main check >/dev/null
 main links >/dev/null
@@ -85,6 +88,9 @@ main add socks --port 39211 --ip 203.0.113.1 --country US --generate-only --out-
 expect_failure wrong-command
 expect_failure route unknown
 expect_failure route status extra
+expect_failure route on extra
+expect_failure route allow add
+expect_failure route update --bad
 expect_failure install --unknown
 expect_failure install --proto hy2 --non-interactive
 expect_failure add wrong-protocol
@@ -95,7 +101,7 @@ expect_failure regen --unknown
 expect_failure update --unknown
 expect_failure sync --unknown
 expect_failure uninstall --unknown
-[[ ! -s "$events" && ! -e "$SB_LOCK" && ! -e "$SB_CONFIG" && ! -e "$SB_BIN" ]] || fail "read-only or invalid dispatch changed installed state"
+[[ ! -s "$events" && ! -e "$SB_LOCK" && ! -e "$SB_CONFIG" && ! -e "$SB_BIN" && ! -e "$SB_RULES_DIR" ]] || fail "read-only or invalid dispatch changed installed state"
 
 (
   exec 7>>"$SB_LOCK"
@@ -109,6 +115,9 @@ expect_failure uninstall --unknown
 main route block-cn-on >/dev/null
 [[ "$(cat "$events")" == $'mutate\nsync' ]] || fail "expected one protected mutation and one publication"
 (exec 7>>"$SB_LOCK"; flock -n 7) || fail "a finished action retained the lock"
+: >"$events"
+main route on >/dev/null
+[[ "$(cat "$events")" == $'mutate\nsync' ]] || fail "route on did not mutate and publish under lock"
 : >"$events"
 main sync >/dev/null
 [[ "$(cat "$events")" == sync ]] || fail "explicit sync did not publish under the write lock"

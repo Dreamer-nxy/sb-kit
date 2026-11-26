@@ -130,7 +130,40 @@ for lf in "${SB_LOG_DIR}"/*.log; do
   [[ "$inv" -gt 0 ]] && warn "  检测到 ${inv} 次无效 REALITY 握手（扫描器探测或客户端参数不一致）"
 done
 
-hdr "6. SSH 基础安全"
+hdr "6. 回国阻断路由与规则集状态"
+if [[ -f /etc/sing-box/config.json ]]; then
+  if [[ -f /etc/sing-box/rules/route-state.json ]] && command -v python3 >/dev/null 2>&1; then
+    route_summary=$(python3 - /etc/sing-box/rules/route-state.json <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    d = {}
+print(f"{d.get('mode', 'off')}|{d.get('geosite_commit', '')}|{d.get('updated_at', '')}")
+PY
+    )
+    r_mode="${route_summary%%|*}"
+    r_rest="${route_summary#*|}"
+    r_sha="${r_rest%%|*}"
+    r_upd="${r_rest#*|}"
+    if [[ "$r_mode" == "on" || "$r_mode" == "targeted" ]]; then
+      ok "回国阻断: 已开启 (geosite=${r_sha:-未知}, 更新=${r_upd:-未知})"
+      if systemctl is-active --quiet sbkit-rules-update.timer 2>/dev/null || systemctl is-enabled --quiet sbkit-rules-update.timer 2>/dev/null; then
+        ok "规则集每周自动更新定时器已启用 (sbkit-rules-update.timer)"
+      else
+        warn "规则集自动更新定时器未启用，可运行 sbctl route block-cn-on 重新挂载"
+      fi
+    else
+      ok "回国阻断: 已关闭（仅拦截内网/25端口/BT）"
+    fi
+  elif grep -q '"geoip-cn"' /etc/sing-box/config.json 2>/dev/null; then
+    warn "检测到旧版 geoip-cn 规则，建议运行 sbctl route block-cn-on 升级至 v2fly 精准规则集"
+  else
+    ok "回国阻断: 已关闭（仅拦截内网/25端口/BT）"
+  fi
+fi
+
+hdr "7. SSH 基础安全"
 if command -v sshd >/dev/null 2>&1; then
   pa=$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2; exit}' || true)
   if [[ "$pa" == "yes" ]]; then

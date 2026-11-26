@@ -39,4 +39,35 @@ grep -q dummy-cf-token "${C}/hy2-8446.json" || { echo "FAIL: modify dropped DNS-
 python3 "$GEN" regen --conf-dir "$C" --meta-dir "$M" --state-dir "$S" --sb-ver "$SB_VER" --sb-bin "$SB_BIN" >/dev/null
 echo "== sing-box ${SB_VER}: check (modify + regen)"
 "$SB_BIN" check -c "${WORK}/config.json" -C "$C"
+
+# Also validate CN block (21 v2fly categories + explicit supplements + custom lists)
+# against real upstream .srs rule-sets when SB_CHECK_CN_RULES != 0.
+if [[ "${SB_CHECK_CN_RULES:-1}" != "0" ]]; then
+  R="${SB_RULES_CACHE_DIR:-${WORK}/rules}"
+  mkdir -p "$R"
+  ALLOW="${WORK}/cn-allow.list"
+  BLOCK="${WORK}/cn-block.list"
+  printf 'example.cn\n' >"$ALLOW"
+  printf 'blocked.example.com\n' >"$BLOCK"
+  echo "== sing-box ${SB_VER}: check CN block (on)"
+  while IFS='|' read -r _ fn url; do
+    [[ -n "$fn" ]] || continue
+    if [[ ! -s "${R}/${fn}" ]]; then
+      dl_ok=0
+      for attempt in 1 2 3; do
+        if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "${R}/${fn}.part" && [[ -s "${R}/${fn}.part" ]]; then
+          mv -f "${R}/${fn}.part" "${R}/${fn}"
+          dl_ok=1
+          break
+        fi
+        rm -f "${R}/${fn}.part"
+        sleep "$attempt"
+      done
+      [[ "$dl_ok" == "1" ]] || { echo "FAIL: could not download $url" >&2; exit 1; }
+    fi
+  done < <(python3 "$GEN" route-plan --mode on)
+  python3 "$GEN" base-config --out "${WORK}/config-cn-on.json" --log-file "${WORK}/error.log" \
+    --cn-mode on --rules-dir "$R" --allow-file "$ALLOW" --block-file "$BLOCK"
+  "$SB_BIN" check -c "${WORK}/config-cn-on.json" -C "$C"
+fi
 echo "== sing-box ${SB_VER}: OK"

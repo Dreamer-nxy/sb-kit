@@ -43,6 +43,157 @@ PROTO_LABELS = {
     "socks": "Socks",
 }
 
+CN_MODES = ("off", "on")
+GEOSITE_SRS_BASE = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
+
+# Upstream v2fly / SagerNet fine-grained CN categories (mirrors the audited
+# Dufu egress policy: blocks CN entertainment/media/netdisk/social/banks/PT
+# while keeping fingerprint browsers, Feishu, 1688, Tencent Cloud & ordinary
+# websites untouched).
+CN_BLOCK_GEOSITE_TAGS: Tuple[str, ...] = (
+    # Entertainment / Video / Streaming / Music / Netdisk
+    "category-entertainment-cn",
+    "bilibili",
+    "iqiyi",
+    "youku",
+    "tencent-tme",
+    "category-media-cn",
+    "category-netdisk-cn",
+    # Social / Search / Maps / P2P / Security telemetry
+    "category-social-media-cn",
+    "baidu",
+    "xiaohongshu",
+    "amap",
+    "xunlei",
+    "qihoo360",
+    # Banking & Securities (high-risk anti-fraud audit targets)
+    "category-bank-cn",
+    "icbc",
+    "ccb",
+    "cmb",
+    "boc",
+    "category-securities-cn",
+    # BT / PT trackers (datacenter DMCA anti-abuse)
+    "category-pt",
+    "category-public-tracker",
+)
+
+# Minimal explicit supplements for high-risk domestic endpoints not isolated in
+# parent categories (deliberately avoids broad tencent/bytedance/alibaba/cn).
+CN_BLOCK_EXTRA_DOMAINS: Tuple[str, ...] = (
+    "gov.cn",
+    "toutiao.com",
+    "toutiaocdn.com",
+    "toutiaoimg.com",
+    "ixigua.com",
+    "snssdk.com",
+    "weixin.qq.com",
+    "wechat.com",
+    "servicewechat.com",
+    "wx.qq.com",
+    "qq.com",
+    "qpic.cn",
+    "qlogo.cn",
+    "gtimg.cn",
+    "weibo.com",
+    "weibo.cn",
+    "weibocdn.com",
+    "umeng.com",
+    "umengcloud.com",
+    "getui.com",
+    "jpush.cn",
+    "jiguang.cn",
+    "music.163.com",
+    "yun.139.com",
+)
+
+# Built-in allowlist evaluated before built-in block rules so upstream category
+# shifts cannot break fingerprint browsers, Feishu, 1688, TikTok, or OS checks.
+CN_ALLOW_DOMAINS: Tuple[str, ...] = (
+    "adspower.net",
+    "adspower.com",
+    "bitbrowser.cn",
+    "bitbrowser.net",
+    "hubstudio.com",
+    "hubstudio.cn",
+    "feishu.cn",
+    "larksuite.com",
+    "1688.com",
+    "tiktok.com",
+    "tiktokv.com",
+    "tiktokcdn.com",
+    "tiktokrow-cdn.com",
+    "connectivitycheck.gstatic.com",
+)
+
+_DOMAIN_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+)
+
+
+def route_plan_for_mode(mode: str) -> List[Tuple[str, str, str]]:
+    """Return (rule_set_tag, filename, download_url) tuples required for mode."""
+    if mode == "off":
+        return []
+    if mode == "on":
+        return [
+            (f"geosite-{tag}", f"geosite-{tag}.srs", f"{GEOSITE_SRS_BASE}/geosite-{tag}.srs")
+            for tag in CN_BLOCK_GEOSITE_TAGS
+        ]
+    raise ValueError(f"unsupported CN route mode: {mode!r}")
+
+
+# Include legacy geoip-cn.srs so uninstall cleans up older v0.2.x installs too.
+ALL_MANAGED_RULE_FILES = frozenset(
+    [fn for _, fn, _ in route_plan_for_mode("on")]
+    + ["geoip-cn.srs", "route-state.json", "cn-allow.list", "cn-block.list"]
+)
+
+
+def normalize_domain(raw: str) -> str:
+    """Validate and normalize a domain suffix (lowercase, no leading dot)."""
+    domain = raw.strip().lower().lstrip(".")
+    if not domain or len(domain) > 253 or not _DOMAIN_RE.fullmatch(domain):
+        raise ValueError(f"invalid domain suffix: {raw!r}")
+    return domain
+
+
+def load_domain_list(path: Optional[Path]) -> List[str]:
+    if not path or not path.is_file():
+        return []
+    seen = set()
+    result: List[str] = []
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            dom = normalize_domain(line)
+        except ValueError as exc:
+            raise ValueError(f"{path}:{lineno}: {exc}") from exc
+        if dom not in seen:
+            seen.add(dom)
+            result.append(dom)
+    return sorted(result)
+
+
+def save_domain_list(path: Path, domains: List[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    body = "".join(f"{d}\n" for d in sorted(set(domains)))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
 
 def parse_semver(ver: str) -> Tuple[int, int]:
     cleaned = (ver or "").strip().lstrip("v")
@@ -338,7 +489,47 @@ def cmd_base_config(args: argparse.Namespace) -> int:
         "rules": rules,
         "final": "direct",
     }
-    if args.cn_srs:
+
+    mode = getattr(args, "cn_mode", "off") or "off"
+    rules_dir = Path(args.rules_dir) if getattr(args, "rules_dir", "") else None
+    allow_file = Path(args.allow_file) if getattr(args, "allow_file", "") else None
+    block_file = Path(args.block_file) if getattr(args, "block_file", "") else None
+
+    try:
+        user_allow = load_domain_list(allow_file)
+        user_block = load_domain_list(block_file)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if mode == "on":
+        if not rules_dir:
+            print("ERROR: --cn-mode on requires --rules-dir", file=sys.stderr)
+            return 1
+        plan = route_plan_for_mode("on")
+        route["rule_set"] = [
+            {
+                "tag": tag,
+                "type": "local",
+                "format": "binary",
+                "path": str(rules_dir / filename),
+            }
+            for tag, filename, _ in plan
+        ]
+        # Priority: user allow > user block > built-in allow > built-in block.
+        if user_allow:
+            rules.append({"domain_suffix": user_allow, "action": "route", "outbound": "direct"})
+        if user_block:
+            rules.append({"domain_suffix": user_block, "action": "reject"})
+        rules.append({
+            "domain_suffix": list(CN_ALLOW_DOMAINS),
+            "action": "route",
+            "outbound": "direct",
+        })
+        rules.append({"rule_set": [tag for tag, _, _ in plan], "action": "reject"})
+        rules.append({"domain_suffix": list(CN_BLOCK_EXTRA_DOMAINS), "action": "reject"})
+    elif args.cn_srs:
+        # Legacy single-file geoip-cn interface; include resolve so domain requests match.
         route["rule_set"] = [
             {
                 "tag": "geoip-cn",
@@ -347,6 +538,7 @@ def cmd_base_config(args: argparse.Namespace) -> int:
                 "path": args.cn_srs,
             }
         ]
+        rules.append({"action": "resolve"})
         rules.append({"rule_set": ["geoip-cn"], "action": "reject"})
 
     cfg = {
@@ -365,6 +557,91 @@ def cmd_base_config(args: argparse.Namespace) -> int:
     }
     atomic_write_json(Path(args.out), cfg, mode=0o640)
     return 0
+
+
+def cmd_route_plan(args: argparse.Namespace) -> int:
+    for tag, filename, url in route_plan_for_mode(args.mode):
+        print(f"{tag}|{filename}|{url}")
+    return 0
+
+
+def cmd_route_domains(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    try:
+        current = load_domain_list(path)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if args.action == "list":
+        for dom in current:
+            print(dom)
+        return 0
+
+    if not args.domain:
+        print(f"ERROR: route-domains {args.action} requires a domain", file=sys.stderr)
+        return 1
+    try:
+        target = normalize_domain(args.domain)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if args.action == "add":
+        if target not in current:
+            current.append(target)
+        save_domain_list(path, current)
+        print(f"ADDED={target}")
+        return 0
+    if args.action == "del":
+        if target not in current:
+            print(f"ERROR: domain not found in {path.name}: {target}", file=sys.stderr)
+            return 1
+        current = [d for d in current if d != target]
+        save_domain_list(path, current)
+        print(f"REMOVED={target}")
+        return 0
+    return 1
+
+
+def cmd_route_state(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    if args.action == "get":
+        data: Dict[str, Any] = {}
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except ValueError:
+                data = {}
+        mode = data.get("mode", "")
+        if mode == "targeted":
+            mode = "on"
+        if mode not in CN_MODES:
+            mode = ""
+        print(f"MODE={mode}")
+        print(f"GEOSITE_COMMIT={data.get('geosite_commit', '')}")
+        print(f"UPDATED_AT={data.get('updated_at', '')}")
+        return 0
+
+    if args.action == "set":
+        existing: Dict[str, Any] = {}
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except ValueError:
+                existing = {}
+        state = {
+            "mode": args.mode,
+            "geosite_commit": args.geosite_commit if args.geosite_commit is not None else existing.get("geosite_commit", ""),
+            "updated_at": args.updated_at if args.updated_at is not None else existing.get("updated_at", ""),
+        }
+        atomic_write_json(path, state, mode=0o640)
+        return 0
+    return 1
 
 
 def format_uri(meta: Dict[str, Any]) -> Tuple[str, List[str]]:
@@ -1086,6 +1363,25 @@ def main() -> int:
     p_base.add_argument("--log-file", default="/var/log/sing-box/error.log")
     p_base.add_argument("--log-level", default="error")
     p_base.add_argument("--cn-srs", default="")
+    p_base.add_argument("--cn-mode", default="off", choices=list(CN_MODES))
+    p_base.add_argument("--rules-dir", default="")
+    p_base.add_argument("--allow-file", default="")
+    p_base.add_argument("--block-file", default="")
+
+    p_rplan = sub.add_parser("route-plan")
+    p_rplan.add_argument("--mode", required=True, choices=list(CN_MODES))
+
+    p_rdom = sub.add_parser("route-domains")
+    p_rdom.add_argument("--file", required=True)
+    p_rdom.add_argument("action", choices=["list", "add", "del"])
+    p_rdom.add_argument("domain", nargs="?", default="")
+
+    p_rstate = sub.add_parser("route-state")
+    p_rstate.add_argument("--file", required=True)
+    p_rstate.add_argument("action", choices=["get", "set"])
+    p_rstate.add_argument("--mode", choices=list(CN_MODES), default="off")
+    p_rstate.add_argument("--geosite-commit", default=None)
+    p_rstate.add_argument("--updated-at", default=None)
 
     p_add = sub.add_parser("add")
     p_add.add_argument("--proto", required=True, choices=list(PROTO_LABELS.keys()))
@@ -1151,6 +1447,12 @@ def main() -> int:
         args.cf_token = os.environ.get("SB_CF_TOKEN", "")
     if args.cmd == "base-config":
         return cmd_base_config(args)
+    if args.cmd == "route-plan":
+        return cmd_route_plan(args)
+    if args.cmd == "route-domains":
+        return cmd_route_domains(args)
+    if args.cmd == "route-state":
+        return cmd_route_state(args)
     if args.cmd == "add":
         return cmd_add(args)
     if args.cmd == "modify":
