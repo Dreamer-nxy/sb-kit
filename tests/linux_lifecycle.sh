@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Run as root on a disposable systemd VM. This test uses the public installer
-# and the installed sbctl CLI, and checks the running service and kernel rules.
+# and the installed sb CLI, and checks the running service and kernel rules.
 set -euo pipefail
 
 version=${1:?usage: linux_lifecycle.sh SING_BOX_VERSION}
 repo=$(cd "$(dirname "$0")/.." && pwd)
-ctl=/usr/local/bin/sbctl
+ctl=/usr/local/bin/sb
+legacy_ctl=/usr/local/bin/sbctl
 core=/usr/local/bin/sing-box
 service=sing-box.service
 config=/etc/sing-box
@@ -24,15 +25,21 @@ wait_for_listener() {
   return 1
 }
 [[ $(id -u) == 0 && -d /run/systemd/system ]] || fail "requires a root shell in a systemd VM"
-for path in "$ctl" "$core" "$config" /var/lib/sing-box /var/log/sing-box /usr/local/lib/sb-kit "$dropin"; do
-  [[ ! -e "$path" ]] || fail "expected a fresh VM; found $path"
+for path in "$ctl" "$legacy_ctl" "$core" "$config" /var/lib/sing-box /var/log/sing-box /usr/local/lib/sb-kit "$dropin"; do
+  [[ ! -e "$path" && ! -L "$path" ]] || fail "expected a fresh VM; found $path"
 done
 [[ $(systemctl show "$service" -p LoadState --value) == not-found ]] || fail "existing service"
 
-echo "== Install sing-box $version through sbctl install"
+echo "== Install sing-box $version through the sb-kit installer"
 bash "$repo/sbctl.sh" install --block-cn --version "$version" --proto socks --port 39182 \
   --ip 127.0.0.1 --no-tune --non-interactive >/dev/null
 [[ $("$core" version | awk 'NR==1 {print $3}') == "$version" ]] || fail "installed version"
+[[ $(command -v sb) == "$ctl" ]] || fail "sb is not on the command path"
+[[ ! -e "$legacy_ctl" && ! -L "$legacy_ctl" ]] || fail "installed an obsolete sbctl entry"
+original_version=$(sb v)
+[[ "$original_version" == "sb-kit "*" (sing-box: $version)" && $(sb --version) == "$original_version" ]] || fail "version output differs"
+[[ $(sb i) == *"socks5://"* && $(sb clash) == *"proxies:"* ]] || fail "short node export commands"
+sb s >/dev/null
 systemctl is-active --quiet "$service" && listening 39182 || fail "initial listener"
 [[ $(systemctl show "$service" -p User --value) == sing-box ]] || fail "runtime user"
 [[ -s "$config/rules/geosite-category-netdisk-cn.srs" ]] || fail "fresh install missing CN rules"
@@ -44,7 +51,6 @@ trap 'rm -rf "$fixtures"' EXIT
 cp "$core" "$fixtures/native-core"
 
 echo "== Sync a new CLI and helper from the checkout while sing-box is serving"
-original_version=$("$ctl" --version)
 invocation=$(systemctl show "$service" -p InvocationID --value)
 node_hash=$(sha256sum "$config/conf/socks-39182.json" "$config/meta/socks-39182.json")
 checkout="$fixtures/checkout"
@@ -52,13 +58,13 @@ mkdir "$checkout"
 cp -R "$repo/lib" "$checkout/lib"
 sed -E 's/^SBKIT_VERSION="[^"]+"$/SBKIT_VERSION="91.0.2"/' "$repo/sbctl.sh" >"$checkout/sbctl.sh"
 printf '#!/usr/bin/env bash\necho synced-helper-91.0.2\n' >"$checkout/lib/audit.sh"
-bash "$checkout/sbctl.sh" route status >/dev/null
+bash "$checkout/sbctl.sh" cn >/dev/null
 bash "$checkout/sbctl.sh" add socks --help >/dev/null
 if bash "$checkout/sbctl.sh" misspelled-command >/dev/null 2>&1; then fail "accepted an unknown command"; fi
 [[ $("$ctl" --version) == "$original_version" ]] || fail "a read-only or invalid staged command published the candidate"
 (cd "$checkout" && "$ctl" sync)
 [[ $("$ctl" --version) == "sb-kit 91.0.2 (sing-box: $version)" ]] || fail "sync did not publish the new CLI"
-[[ $("$ctl" audit) == synced-helper-91.0.2 ]] || fail "sync did not publish the matching helper"
+[[ $("$ctl" check) == synced-helper-91.0.2 ]] || fail "sync did not publish the matching helper"
 (cd "$fixtures" && bash "$repo/sbctl.sh" sync)
 [[ $("$ctl" --version) == "$original_version" ]] || fail "staged sync did not restore the repository version"
 [[ $(systemctl show "$service" -p InvocationID --value) == "$invocation" ]] && listening 39182 || fail "sync interrupted the service"
@@ -80,10 +86,10 @@ rmdir "$dropin"
 systemctl daemon-reload
 
 echo "== Add a protected node, restart, regenerate and remove it"
-"$ctl" add socks --port 39183 --ip 127.0.0.1 --country US \
+"$ctl" a socks --port 39183 --ip 127.0.0.1 --country US \
   --whitelist 192.0.2.1,2001:db8::1 --non-interactive >/dev/null
 [[ " $(systemctl show "$service" -p Requires --value) " == *" ${guard}.service "* ]] || fail "missing required guard"
-systemctl restart "$service"
+"$ctl" r >/dev/null
 systemctl is-active --quiet "${guard}.service" && wait_for_listener 39183 || fail "protected listener"
 rules=$(nft list table inet "$guard")
 [[ "$rules" == *192.0.2.1* && "$rules" == *2001:db8::1* && "$rules" == *drop* ]] || fail "missing guard rules"
@@ -101,12 +107,12 @@ systemctl daemon-reload
 systemctl reset-failed "${guard}.service" "$service"
 systemctl start "$service"
 wait_for_listener 39183 || fail "listener did not recover with its guard"
-"$ctl" modify socks-39183 --remark ci-protected >/dev/null
+"$ctl" c socks-39183 --remark ci-protected >/dev/null
 
 echo "== A failed rebuild must leave both live directories unchanged"
 printf '{' >"$config/meta/zz-invalid.json"
 before=$(sha256sum "$config"/conf/*.json "$config"/meta/*.json)
-if "$ctl" regen >/dev/null; then fail "regen accepted corrupt metadata"; fi
+if "$ctl" rebuild >/dev/null; then fail "regen accepted corrupt metadata"; fi
 [[ $(sha256sum "$config"/conf/*.json "$config"/meta/*.json) == "$before" ]] || fail "regen changed the live files"
 rm "$config/meta/zz-invalid.json"
 # Fail only the candidate's first start. The rollback must restore the original
@@ -124,7 +130,7 @@ systemctl daemon-reload
 # Earlier scenarios restart this same unit. Give the injected failure and its
 # rollback a fresh start counter while keeping the runner's normal rate limit.
 systemctl reset-failed "$service"
-if "$ctl" regen >/dev/null; then fail "regen accepted an unsuccessful service start"; fi
+if "$ctl" rebuild >/dev/null; then fail "regen accepted an unsuccessful service start"; fi
 [[ ! -e /var/lib/sing-box/.ci-fail-first-start ]] || fail "candidate never reached the injected start failure"
 [[ $(sha256sum "$config"/conf/*.json "$config"/meta/*.json) == "$before" ]] || fail "service rollback changed original files"
 systemctl is-active --quiet "$service" && wait_for_listener 39182 || fail "rollback lost original service"
@@ -132,9 +138,9 @@ rm "$main_dropin/ci-start-failure.conf"
 rmdir "$main_dropin"
 systemctl daemon-reload
 systemctl reset-failed "$service"
-"$ctl" regen >/dev/null
+"$ctl" rebuild >/dev/null
 systemctl is-active --quiet "$service" && listening 39183 || fail "regen lost listener"
-"$ctl" del socks-39183 >/dev/null
+"$ctl" d socks-39183 >/dev/null
 if listening 39183 || nft list table inet "$guard" >/dev/null 2>&1; then fail "node or rule survived deletion"; fi
 listening 39182 || fail "deletion removed the other node"
 
@@ -143,7 +149,7 @@ hy_args=(--self-signed --ip 127.0.0.1 --country US --non-interactive)
 "$ctl" add hy2 --port 39187 "${hy_args[@]}" >/dev/null
 old_cert=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["self_cert"])' "$config/meta/hy2-39187.json")
 old_hash=$(sha256sum "$old_cert")
-"$ctl" modify hy2-39187 --port 39188 >/dev/null
+"$ctl" c hy2-39187 --port 39188 >/dev/null
 "$ctl" add hy2 --port 39187 "${hy_args[@]}" >/dev/null
 [[ $(sha256sum "$old_cert") == "$old_hash" ]] || fail "port reuse overwrote the certificate"
 for port in 39187 39188; do
@@ -151,18 +157,25 @@ for port in 39187 39188; do
 done
 
 echo "== Enable CN block, custom allow/block lists, regen & timer"
-"$ctl" route block-cn-on >/dev/null
+"$ctl" cn on >/dev/null
 [[ -f "$config/rules/route-state.json" && -f "$config/rules/geosite-category-netdisk-cn.srs" ]] || fail "CN block rules missing"
 systemctl is-enabled --quiet sbkit-rules-update.timer || fail "rules update timer not enabled"
-"$ctl" route allow add example.cn >/dev/null
-"$ctl" route block add blocked.example.com >/dev/null
+"$ctl" allow example.cn >/dev/null
+"$ctl" block blocked.example.com >/dev/null
+[[ $("$ctl" allow) == example.cn && $("$ctl" block) == blocked.example.com ]] || fail "domain lists"
 grep -Fq '"example.cn"' "$config/config.json" && grep -Fq '"blocked.example.com"' "$config/config.json" || fail "custom lists not rendered"
-"$ctl" regen >/dev/null
+"$ctl" rebuild >/dev/null
 grep -Fq '"geosite-category-netdisk-cn"' "$config/config.json" && grep -Fq '"example.cn"' "$config/config.json" || fail "regen lost CN block route config"
 systemctl is-active --quiet "$service" && listening 39182 || fail "listener lost after route/regen"
 
+"$ctl" allow del example.cn >/dev/null
+"$ctl" block del blocked.example.com >/dev/null
+if grep -Fq '"example.cn"' "$config/config.json" || grep -Fq '"blocked.example.com"' "$config/config.json"; then
+  fail "deleted domain still active"
+fi
+
 echo "== Uninstall, preserve an unrelated file, refuse unmanaged uninstall"
-"$ctl" modify socks-39182 --whitelist 192.0.2.2 >/dev/null
+"$ctl" c socks-39182 --whitelist 192.0.2.2 >/dev/null
 nft list table inet sbkit_wl_socks_39182 >/dev/null
 printf '%s\n' preserve >"$config/operator-note.txt"
 "$ctl" uninstall --keep-tcpfit >/dev/null
@@ -172,7 +185,7 @@ if listening 39182 || systemctl is-active --quiet "$service"; then fail "service
 [[ ! -e "$config/rules/geosite-category-netdisk-cn.srs" && ! -e "$config/rules/route-state.json" ]] || fail "managed route rules survived uninstall"
 if nft list table inet sbkit_wl_socks_39182 >/dev/null 2>&1; then fail "uninstall left a kernel filter"; fi
 [[ ! -e "$ctl" && ! -e "$core" && ! -e "$config/config.json" && ! -e "$config/.managed-by-sb-kit" ]] || fail "managed installation remained"
-[[ ! -e /usr/local/lib/sb-kit && ! -L "$ctl" ]] || fail "synced toolkit remained after uninstall"
+[[ ! -e /usr/local/lib/sb-kit && ! -L "$ctl" && ! -e "$legacy_ctl" && ! -L "$legacy_ctl" ]] || fail "synced toolkit remained after uninstall"
 [[ $(cat "$config/operator-note.txt") == preserve ]] || fail "operator file lost"
 [[ ! -e "$old_cert" ]] || fail "managed certificate survived uninstall"
 if bash "$repo/sbctl.sh" uninstall --keep-tcpfit >/dev/null; then fail "unmanaged uninstall accepted"; fi

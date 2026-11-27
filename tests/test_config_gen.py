@@ -264,7 +264,7 @@ class TestSbKitConfigGen(unittest.TestCase):
         run_gen("base-config", "--out", str(cfg), "--cn-mode", "on", "--rules-dir", str(rules))
         shell = ('source "$1"; SB_CONFIG="$2"; SB_RULES_DIR="$3"; need_root() { :; }; '
                  'systemctl() { printf "%s\n" LoadState=loaded ActiveState=inactive UnitFileState=enabled; }; '
-                 'cmd_route status')
+                 'cmd_route')
         for version, label in (("abcd1234abcd", "未经固定"), ("a" * 40, "已固定")):
             run_gen("route-state", "--file", str(rules / "route-state.json"), "set",
                     "--mode", "on", "--geosite-commit", version)

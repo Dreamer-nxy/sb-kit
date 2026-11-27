@@ -10,7 +10,7 @@
 set -euo pipefail
 umask 022
 
-SBKIT_VERSION="0.3.1"
+SBKIT_VERSION="0.4.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LIB_DIR="${SCRIPT_DIR}/lib"
@@ -44,7 +44,7 @@ SB_BACKUP_ROOT="/var/backups/sb-kit"
 PRE_INSTALL_BACKUP=""
 SB_UNIT="/etc/systemd/system/sing-box.service"
 SB_LOGROTATE="/etc/logrotate.d/sing-box"
-SB_CTL_DST="/usr/local/bin/sbctl"
+SB_CTL_DST="/usr/local/bin/sb"
 SB_LIB_DST="/usr/local/lib/sb-kit"
 SB_LOCK="/run/sb-kit.lock"
 SB_LOCK_HELD=0
@@ -73,21 +73,21 @@ warn() { printf '%b[!]%b %s\n' "$C_YELLOW" "$C_NC" "$*" >&2; }
 die()  { printf '%b[x]%b %s\n' "$C_RED" "$C_NC" "$*" >&2; exit 1; }
 
 need_root() {
-  [[ "$(id -u)" -eq 0 ]] || die "请使用 root 权限运行（例如 sudo sbctl ...）"
+  [[ "$(id -u)" -eq 0 ]] || die "请使用 root 权限运行（例如 sudo sb ...）"
 }
 
 acquire_lock() {
   [[ "$SB_LOCK_HELD" == "1" ]] && return 0
   need_cmd flock
   exec 9>>"$SB_LOCK" || die "无法打开写锁: $SB_LOCK"
-  flock -n 9 || die "另一个 sbctl 正在运行（锁文件: ${SB_LOCK}），请稍后再试"
+  flock -n 9 || die "另一个 sb 写操作正在运行（锁文件: ${SB_LOCK}），请稍后再试"
   SB_LOCK_HELD=1
   recover_route_transaction || die "未能恢复路由事务，请检查保留的备份目录"
 }
 
 proto_net_type() {
   case "$1" in
-    hy2|hysteria2)       echo "udp" ;;
+    hy|hy2|hysteria2)       echo "udp" ;;
     naive|ss2022|ss|socks|socks5) echo "tcp+udp" ;;
     *)                   echo "tcp" ;;
   esac
@@ -95,7 +95,7 @@ proto_net_type() {
 
 require_supported_protocol() {
   case "$1" in
-    vless-reality|reality|vless|hy2|hysteria2|naive|anytls|ss2022|ss|socks|socks5) ;;
+    r|vless-reality|reality|vless|hy|hy2|hysteria2|naive|anytls|ss2022|ss|socks|socks5) ;;
     *) die "不支持的协议: $1" ;;
   esac
 }
@@ -234,6 +234,18 @@ is_staging_copy() {
      ! -f "$SCRIPT_DIR/.sb-kit-manifest" && -f "$SCRIPT_DIR/sbctl.sh" ]]
 }
 
+check_cli_name() {
+  local selected unit_dir="${SB_UNIT%/*}" old="${SB_CTL_DST%/*}/sbctl"
+  if selected=$(type -P sb) && [[ "$selected" != "$SB_CTL_DST" && ! "$selected" -ef "$SB_CTL_DST" ]]; then
+    die "命令 sb 已由 $selected 提供，请先解决命名冲突"
+  fi
+  if [[ -f "$unit_dir/sbkit-rules-update.service" ]] &&
+     grep -Fxq "ExecStart=$old route update --quiet" "$unit_dir/sbkit-rules-update.service"; then
+    die "旧周更任务仍调用 $old。请先用旧版关闭回国阻断，同步后运行 sb cn on 重新开启。"
+  fi
+  python3 "$LIB_DIR/bundle.py" check-cli "$SB_LIB_DST" "$SB_CTL_DST" || die "管理命令路径检查失败"
+}
+
 install_self() {
   local quiet="${1:-0}" source="${2:-}" version
   [[ "$(id -u)" == 0 ]] || return 0
@@ -243,6 +255,7 @@ install_self() {
   fi
   acquire_lock
   need_cmd python3
+  check_cli_name
   version=$(python3 "$LIB_DIR/bundle.py" publish "$source" "$SB_LIB_DST" "$SB_CTL_DST") ||
     die "同步失败，请检查源码或安装目录"
   if [[ "$quiet" != 1 ]]; then ok "管理命令已就绪: ${SB_CTL_DST} (sb-kit ${version})"; fi
@@ -845,15 +858,19 @@ install_tcpfit() {
 
 cmd_tune() {
   local bw="500" rtt="" swap_size="auto" do_rollback=0
+  if [[ "${1:-}" == reset ]]; then
+    [[ $# == 1 ]] || die "用法: sb bbr reset"
+    do_rollback=1
+    shift
+  fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --bw)       bw="$2"; shift 2 ;;
       --rtt)      rtt="$2"; shift 2 ;;
       --swap)     swap_size="$2"; shift 2 ;;
       --no-swap)  swap_size=""; shift ;;
-      --rollback) do_rollback=1; shift ;;
       -h|--help)
-        echo "用法: sbctl tune [--bw 500] [--rtt auto|160] [--swap auto|1G|--no-swap] [--rollback]"
+        echo "用法: sb bbr [--bw 500] [--rtt auto|160] [--swap auto|1G|--no-swap] 或 sb bbr reset"
         return 0
         ;;
       *) die "未知参数: $1" ;;
@@ -894,7 +911,7 @@ cmd_tune() {
     info "配置 Swap (${swap_size})..."
     TCPFIT_NO_TELEMETRY=1 "$TCPFIT_BIN" harden --swap "$swap_size"
   fi
-  ok "BBR / TCP 调优完成（随时可运行 sbctl tune --rollback 还原出厂快照）"
+  ok "BBR / TCP 调优完成（随时可运行 sb bbr reset 还原出厂快照）"
 }
 
 select_reality_sni() {
@@ -1200,9 +1217,19 @@ print_node_result() {
 }
 
 cmd_add() {
-  local proto="${1:-}"
-  [[ -n "$proto" ]] || die "请指定协议: vless-reality | hy2 | naive | anytls | ss2022 | socks"
-  shift
+  local proto
+  if [[ $# == 0 ]]; then
+    [[ -t 0 ]] || die "请指定协议，例如 sb add socks"
+    local choice
+    local -a protocols=(vless-reality hy2 naive anytls ss2022 socks)
+    printf '  1) VLESS-REALITY  2) Hy2  3) Naive  4) AnyTLS  5) SS2022  6) SOCKS\n' >&2
+    read -rp "请选择协议 [1-6]: " choice || return 1
+    [[ "$choice" =~ ^[1-6]$ ]] || die "无效的协议选项"
+    proto=${protocols[choice-1]}
+  else
+    proto=$1
+    shift
+  fi
 
   local port="" sni="" domain="" cert="" key="" email="" cf_token="${SB_CF_TOKEN:-}" remark="" ip="" country=""
   local hop_range="" masquerade="" whitelist="" self_signed=0 generate_only=0 out_dir=""
@@ -1231,7 +1258,8 @@ cmd_add() {
       --non-interactive) non_interactive=1; shift ;;
       --skip-cn)         skip_cn=1; shift ;;
       -h|--help)
-        echo "用法: sbctl add <vless-reality|hy2|naive|anytls|ss2022|socks> [--port N] [--sni HOST] [--domain HOST] [--hop-range A:B] [--masquerade URL] [--whitelist IP1,IP2]"
+        echo "用法: sb add [vless-reality|hy2|naive|anytls|ss2022|socks] [--port N] [--sni HOST] [--domain HOST] [--hop-range A:B] [--masquerade URL] [--whitelist IP1,IP2]"
+        echo "快捷协议: sb a r（REALITY）、sb a hy（Hysteria2）、sb a ss（Shadowsocks 2022）"
         echo "提示: Cloudflare DNS-01 Token 建议通过环境变量 SB_CF_TOKEN 传入。"
         return 0
         ;;
@@ -1243,11 +1271,11 @@ cmd_add() {
   if [[ "$generate_only" -eq 0 ]]; then
     need_root
     acquire_lock
-    [[ -x "$SB_BIN" ]] || die "未检测到 sing-box，请先运行: sbctl install"
+    [[ -x "$SB_BIN" ]] || die "未检测到 sing-box，请先运行: sb install"
   fi
 
   case "$proto" in
-    vless-reality|reality|vless)
+    r|vless-reality|reality|vless)
       proto="vless-reality"
       if [[ -z "$port" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
         read -rp "请输入 VLESS-Reality 监听端口 [回车默认 443，可自由修改]: " port
@@ -1256,7 +1284,7 @@ cmd_add() {
       [[ "$generate_only" -eq 0 ]] && port=$(pick_free_port "$port" "$(proto_net_type "$proto")" "$non_interactive")
       sni=$(select_reality_sni "$sni" "$non_interactive" "$skip_cn")
       ;;
-    hy2|hysteria2)
+    hy|hy2|hysteria2)
       proto="hy2"
       if [[ -z "$port" && "$non_interactive" -eq 0 && -t 0 && "$generate_only" -eq 0 ]]; then
         read -rp "请输入 Hysteria2 UDP 监听端口 [回车默认 8443]: " port
@@ -1469,7 +1497,7 @@ cmd_modify() {
       --masquerade)      new_masq="$2"; shift 2 ;;
       --rotate-creds)    rotate=1; shift ;;
       -h|--help)
-        echo "用法: sbctl modify <tag> [--port N] [--sni auto|HOST] [--rotate-creds] [--remark NAME] [--whitelist IP1,IP2|--clear-whitelist] [--hop-range A:B|--clear-hop-range] [--masquerade URL]"
+        echo "用法: sb change [tag] [--port N] [--sni auto|HOST] [--rotate-creds] [--remark NAME] [--whitelist IP1,IP2|--clear-whitelist] [--hop-range A:B|--clear-hop-range] [--masquerade URL]"
         return 0
         ;;
       *) die "未知参数: $1" ;;
@@ -1604,17 +1632,15 @@ PY
 }
 
 cmd_links() {
-  local meta_dir="${1:-$SB_META_DIR}"
-  python3 "${LIB_DIR}/config_gen.py" links --meta-dir "$meta_dir"
+  python3 "${LIB_DIR}/config_gen.py" links --meta-dir "${1:-$SB_META_DIR}"
 }
 
 cmd_yaml() {
-  local meta_dir="${1:-$SB_META_DIR}"
-  python3 "${LIB_DIR}/config_gen.py" yaml --meta-dir "$meta_dir"
+  python3 "${LIB_DIR}/config_gen.py" yaml --meta-dir "${1:-$SB_META_DIR}"
 }
 
 cmd_del() {
-  [[ $# -le 1 && "${1:-}" != -* ]] || die "用法: sbctl del [tag]"
+  [[ $# -le 1 && "${1:-}" != -* ]] || die "用法: sb del [tag]"
   need_root
   acquire_lock
   local target="${1:-}"
@@ -1649,15 +1675,10 @@ cmd_del() {
 
 route_help() {
   cat <<'EOF'
-用法:
-  sbctl route [status]                  查看回国阻断状态、规则集版本与自定义名单
-  sbctl route block-cn-on | on          开启回国阻断（杜甫 v2fly 精准方案 + 每周自动更新）
-  sbctl route block-cn-off | off        关闭 sb-kit 回国阻断规则
-  sbctl route update [--quiet]          更新并校验规则集；显式 update 可迁移旧版 geoip-cn
-  sbctl route allow <list|add|del> [域名]
-                                        查看 / 增删自定义放行域名后缀（最高优先级）
-  sbctl route block <list|add|del> [域名]
-                                        查看 / 增删自定义拦截域名后缀
+sb cn               查看回国阻断状态、规则版本及名单条数
+sb cn on            开启回国阻断与每周规则更新
+sb cn off           关闭回国阻断
+sb cn update        更新规则集（旧版 geoip-cn 会迁移到域名分类策略）
 EOF
 }
 
@@ -1684,16 +1705,16 @@ route_timer_status() {
 }
 
 cmd_route() {
-  local action="${1:-status}"
+  local action="${1:-}"
   if [[ $# -gt 0 ]]; then shift; fi
 
   case "$action" in
-    -h|--help|help)
+    -h|--help)
       route_help
       return 0
       ;;
-    status)
-      [[ $# -eq 0 ]] || die "用法: sbctl route [status]"
+    "")
+      [[ $# -eq 0 ]] || die "用法: sb cn"
       need_root
       local mode state_file allow_file block_file st_out gs_sha updated
       local allow_cnt=0 block_cnt=0 srs_cnt=0 timer_state="" status_rc=0
@@ -1724,7 +1745,7 @@ cmd_route() {
         printf '  自动更新定时器: %s\n' "$timer_state"
       elif [[ "$mode" == "legacy" ]]; then
         info "当前回国阻断: 已开启（旧版 geoip-cn，按目标 IP 拦截）"
-        info "运行 sbctl route update 迁移到域名分类策略，或运行 sbctl route off 关闭。"
+        info "运行 sb cn update 迁移到域名分类策略，或运行 sb cn off 关闭。"
       else
         info "当前回国阻断: 已关闭"
       fi
@@ -1732,14 +1753,14 @@ cmd_route() {
         "$allow_cnt" "$allow_file" "$block_cnt" "$block_file"
       return "$status_rc"
       ;;
-    block-cn-on|on)
-      [[ $# -eq 0 ]] || die "用法: sbctl route block-cn-on"
+    on)
+      [[ $# -eq 0 ]] || die "用法: sb cn on"
       need_root
       acquire_lock
       ensure_base_config on 0 0 || return 1
       ;;
-    block-cn-off|off)
-      [[ $# -eq 0 ]] || die "用法: sbctl route block-cn-off"
+    off)
+      [[ $# -eq 0 ]] || die "用法: sb cn off"
       need_root
       acquire_lock
       ensure_base_config off 0 0 || return 1
@@ -1749,7 +1770,7 @@ cmd_route() {
       if [[ $# -eq 1 && "$1" == "--quiet" ]]; then
         quiet=1
       elif [[ $# -ne 0 ]]; then
-        die "用法: sbctl route update [--quiet]"
+        die "用法: sb cn update [--quiet]"
       fi
       need_root
       acquire_lock
@@ -1768,43 +1789,36 @@ cmd_route() {
       esac
       ensure_base_config on 1 "$quiet" || return 1
       ;;
-    allow|block)
-      [[ $# -ge 1 && $# -le 2 ]] || die "用法: sbctl route ${action} <list|add|del> [域名]"
-      local op="$1" domain="${2:-}" list_file
-      if [[ "$action" == "allow" ]]; then
-        list_file="${SB_RULES_DIR}/${SB_ALLOW_LIST_NAME}"
-      else
-        list_file="${SB_RULES_DIR}/${SB_BLOCK_LIST_NAME}"
-      fi
-      case "$op" in
-        list)
-          [[ $# -eq 1 ]] || die "用法: sbctl route ${action} list"
-          need_root
-          local entries
-          entries=$(python3 "${LIB_DIR}/config_gen.py" route-domains --file "$list_file" list) || return 1
-          if [[ -n "$entries" ]]; then
-            printf '%s\n' "$entries"
-          else
-            info "(${action} 自定义名单为空)"
-          fi
-          ;;
-        add|del)
-          [[ $# -eq 2 && -n "$domain" ]] || die "用法: sbctl route ${action} ${op} <域名>"
-          need_root
-          acquire_lock
-          local mode
-          mode=$(current_cn_mode) || return 1
-          if [[ "$mode" == legacy ]]; then
-            warn "旧版 geoip-cn 不使用域名名单；请先运行 sbctl route update 迁移，或运行 sbctl route off 关闭。"
-            return 1
-          fi
-          ensure_base_config "$mode" 0 0 "${list_file##*/}" "$op" "$domain" || return 1
-          ;;
-        *) die "用法: sbctl route ${action} <list|add|del> [域名]" ;;
-      esac
-      ;;
-    *) die "未知路由操作: ${action}（运行 sbctl route --help 查看用法）" ;;
+    *) die "未知回国阻断操作: ${action}（运行 sb cn --help 查看用法）" ;;
   esac
+}
+
+cmd_domain_list() {
+  local action=$1 file=$SB_ALLOW_LIST_NAME op=add domain entries mode
+  shift
+  [[ "$action" == allow ]] || file=$SB_BLOCK_LIST_NAME
+  local usage="用法: sb $action 查看名单，sb $action <域名> 添加，sb $action del <域名> 删除"
+  if [[ $# == 0 ]]; then
+    need_root
+    entries=$(python3 "$LIB_DIR/config_gen.py" route-domains --file "$SB_RULES_DIR/$file" list) || return 1
+    if [[ -n "$entries" ]]; then printf '%s\n' "$entries"; else info "($action 自定义名单为空)"; fi
+    return 0
+  fi
+  if [[ "$1" == del ]]; then
+    op=del
+    shift
+  fi
+  [[ $# == 1 && -n "$1" && "$1" != -* ]] || die "$usage"
+  domain=$1
+  python3 "$LIB_DIR/config_gen.py" route-domains --file "$SB_RULES_DIR/$file" validate "$domain" || return 1
+  need_root
+  acquire_lock
+  mode=$(current_cn_mode) || return 1
+  if [[ "$mode" == legacy ]]; then
+    warn "旧版 geoip-cn 不使用域名名单；请先运行 sb cn update 迁移，或运行 sb cn off 关闭。"
+    return 1
+  fi
+  ensure_base_config "$mode" 0 0 "$file" "$op" "$domain"
 }
 
 cmd_install() {
@@ -1829,7 +1843,7 @@ cmd_install() {
       --non-interactive) non_interactive=1; shift ;;
       --skip-cn)         skip_cn=1; shift ;;
       -h|--help)
-        echo "用法: sbctl install [--proto vless-reality|hy2|naive|anytls|ss2022|socks] [--port 443] [--sni auto|HOST] [--bw 500] [--rtt auto|160] [--no-tune] [--block-cn]"
+        echo "用法: sb install [--proto vless-reality|hy2|naive|anytls|ss2022|socks] [--port 443] [--sni auto|HOST] [--bw 500] [--rtt auto|160] [--no-tune] [--block-cn]"
         return 0
         ;;
       *) die "未知参数: $1" ;;
@@ -1839,7 +1853,7 @@ cmd_install() {
   require_supported_protocol "$proto"
   [[ -z "$port" ]] || valid_port "$port" || die "无效端口: $port"
   case "$proto" in
-    hy2|hysteria2|naive|anytls)
+    hy|hy2|hysteria2|naive|anytls)
       if [[ -z "$domain" && ( "$non_interactive" -eq 1 || ! -t 0 ) ]]; then
         die "该协议的非交互安装需要 --domain"
       fi
@@ -1848,6 +1862,7 @@ cmd_install() {
   need_root
   acquire_lock
   ensure_base_deps
+  check_cli_name
   backup_existing_singbox
   install_self
   install_singbox_binary "$sb_ver"
@@ -1906,7 +1921,7 @@ PY
 cmd_regen() (
   need_root
   acquire_lock
-  [[ -x "$SB_BIN" ]] || die "未检测到 sing-box，请先运行: sbctl install"
+  [[ -x "$SB_BIN" ]] || die "未检测到 sing-box，请先运行: sb install"
   compgen -G "${SB_META_DIR}/*.json" >/dev/null || die "当前没有可重建的节点元数据"
 
   local stage keep_stage=0 was_active=0 sb_ver out count
@@ -1978,7 +1993,7 @@ cmd_regen() (
 )
 
 cmd_update() {
-  [[ $# -le 1 && "${1:-}" != -* ]] || die "用法: sbctl update [版本]"
+  [[ $# -le 1 && "${1:-}" != -* ]] || die "用法: sb update [版本]"
   need_root
   acquire_lock
   local target_ver="${1:-latest}"
@@ -1989,7 +2004,7 @@ cmd_update() {
       if restore_singbox_binary; then
         validate_and_restart || warn "回滚后重启异常，请手动检查 journalctl -u sing-box"
       fi
-      die "已中止升级并回滚核心（若是 1.13 -> 1.14 跨版本语法变更，可先确认后使用 sbctl regen）"
+      die "已中止升级并回滚核心（若是 1.13 -> 1.14 跨版本语法变更，可先确认后使用 sb rebuild）"
     fi
   fi
   rm -f "${SB_BIN}.bak"
@@ -2008,7 +2023,7 @@ cmd_sync() {
   elif [[ $# == 0 ]]; then
     if is_staging_copy; then source="$SCRIPT_DIR"; else source="$PWD"; fi
   else
-    die "用法: sbctl sync [--source 仓库目录]"
+    die "用法: sb sync [--source 仓库目录]"
   fi
   [[ -n "$source" ]] || die "请指定 sb-kit 源码目录"
   need_root
@@ -2024,12 +2039,13 @@ cmd_audit() {
 cmd_uninstall() {
   local keep_tcpfit=0 marker="${SB_DIR}/.managed-by-sb-kit" origin=legacy snapshot="" svc name directory
   if [[ $# -gt 0 ]]; then
-    [[ $# -eq 1 && "$1" == "--keep-tcpfit" ]] || die "用法: sbctl uninstall [--keep-tcpfit]"
+    [[ $# -eq 1 && "$1" == "--keep-tcpfit" ]] || die "用法: sb uninstall [--keep-tcpfit]"
     keep_tcpfit=1
   fi
   need_root
   acquire_lock
   require_managed_installation
+  python3 "$LIB_DIR/bundle.py" check-cli "$SB_LIB_DST" "$SB_CTL_DST" || die "管理命令路径检查失败"
   if [[ -s "$marker" ]]; then
     [[ "$(sed -n '1p' "$marker")" == sb-kit-v1 ]] || die "无法识别托管标记，已中止卸载"
     origin=$(sed -n '2p' "$marker")
@@ -2096,7 +2112,7 @@ cmd_uninstall() {
   fi
   python3 "$LIB_DIR/bundle.py" uninstall "$SB_LIB_DST" "$SB_CTL_DST" ||
     die "清理托管版本失败，请检查安装目录"
-  rm -f "$marker" "$SB_DIR/.sb-kit-tcpfit-tuned" "$SB_CTL_DST" || die "移除 sb-kit 管理文件失败"
+  rm -f "$marker" "$SB_DIR/.sb-kit-tcpfit-tuned" || die "移除 sb-kit 管理文件失败"
   for name in audit.sh config_gen.py sni_probe.py managed_files.py VERSION; do
     rm -f "$SB_LIB_DST/$name" || die "移除 sb-kit 组件 $name 失败"
   done
@@ -2115,28 +2131,33 @@ cmd_uninstall() {
 
 show_help() {
   cat <<EOF
-sbctl (sb-kit ${SBKIT_VERSION}) — 纯 sing-box + tcpfit 精简管理工具（无面板、无二维码、仅纯链接）
+sb (sb-kit ${SBKIT_VERSION})  管理 sing-box 节点
 
-用法:
-  sbctl                             打开终端可视化交互菜单
-  sbctl install [选项]              一键安装 sing-box + 自动 BBR 调优 + 首个节点
-  sbctl add <协议> [选项]           添加节点 (vless-reality|hy2|naive|anytls|ss2022|socks)
-  sbctl modify [tag] [选项]         修改已有节点（端口/SNI/密钥/备注/白名单/跳跃/伪装）
-  sbctl links                       查看全部节点链接（socks 附指纹浏览器格式）
-  sbctl yaml                        按需导出 Clash/Mihomo proxies YAML 片段
-  sbctl del [tag]                   删除节点
-  sbctl tune [--bw N --rtt auto]    BBR/TCP 调优（支持 --rollback）
-  sbctl route [status|block-cn-on|off|update|allow|block]
-                                    回国阻断开关（v2fly 精准方案）与规则更新
-  sbctl audit                       一键只读安全巡检
-  sbctl update [ver]                仅升级 sing-box 核心（SHA-256 校验，失败自动回滚）
-  sbctl regen                       按当前 sing-box 版本语法从 meta 重建全部入站配置
-  sbctl sync [--source DIR]         从当前仓库或指定源码目录同步 sbctl 与 lib 到 /usr/local
-  sbctl --version                   查看 sb-kit 与 sing-box 版本
-  sbctl uninstall [--keep-tcpfit]   彻底卸载
+  sb                  打开菜单
+  sb a [协议]         add，添加节点；例如 sb a r、sb a hy、sb a ss，省略协议时在终端选择
+  sb c [节点]         change，修改节点
+  sb d [节点]         del，删除节点
+  sb i [目录]         info，查看节点链接，可指定离线节点元数据目录
+  sb clash [目录]     导出 Clash/Mihomo 配置片段，可指定离线节点元数据目录
 
-环境变量:
-  SB_CF_TOKEN                       Cloudflare DNS-01 API Token（避免出现在命令行中）
+  sb cn               查看回国阻断状态
+  sb cn on|off|update  开启、关闭或更新回国阻断规则
+  sb allow [域名]     查看放行名单，带域名时添加
+  sb block [域名]     查看拦截名单，带域名时添加
+  sb allow del 域名   从放行名单移除；拦截名单用 sb block del 域名
+
+  sb s                status，查看 sing-box 服务状态
+  sb r                restart，校验配置并重启服务
+  sb start / sb stop  启动 / 停止服务
+  sb v                version，查看管理工具和核心版本
+  sb h                help，显示命令帮助
+  sb check            巡检服务与配置
+  sb bbr [reset]      TCP 调优，reset 恢复原设置
+  sb u [版本]         update，升级 sing-box 核心
+  sb rebuild          按当前核心版本重建节点配置
+  sb sync             从源码目录同步管理工具
+  sb install [选项]   安装 sing-box 和首个节点
+  sb uninstall        卸载 sb-kit
 EOF
 }
 
@@ -2145,7 +2166,7 @@ menu_command() {
   bash "${BASH_SOURCE[0]}" "$@" || warn "命令执行失败，已返回菜单。"
 }
 
-menu_system_action() (
+system_action() (
   need_root
   acquire_lock
   case "$1" in
@@ -2200,14 +2221,14 @@ interactive_menu() {
     printf '  [1]  一键安装（sing-box + 自动 BBR 调优 + 首个节点）\n'
     printf '  [2]  添加节点（VLESS-Reality / Hy2 / Naive / AnyTLS / SS / Socks）\n'
     printf '  [3]  修改节点（改端口 / 换 SNI / 重置账密 / 改白名单或跳跃）\n'
-    printf '  [4]  查看全部节点链接（纯文本直接复制；可选导出 YAML）\n'
+    printf '  [4]  查看全部节点链接（sb i；可选导出 YAML）\n'
     printf '  [5]  删除节点\n'
     printf '  %b──────────────────────────────────────────────────────────%b\n' "$C_DIM" "$C_NC"
     printf '  [6]  BBR / TCP 调优（自动调优 / 重调 / tcpfit 菜单 / 回滚）\n'
     printf '  [7]  路由与回国阻断（开启 / 关闭 / 更新规则 / 自定义放行或拦截）\n'
     printf '  [8]  服务管理（启动 / 停止 / 重启 / 查看错误日志）\n'
-    printf '  [9]  一键安全巡检 (audit)\n'
-    printf '  [10] 核心升级 / 重建配置（update 自动回滚 / regen 跨版本同步）\n'
+    printf '  [9]  一键安全巡检 (sb check)\n'
+    printf '  [10] 核心升级 / 重建配置（sb update / sb rebuild）\n'
     printf '  [11] 彻底卸载\n'
     printf '  [0]  退出\n'
     printf '%b└──────────────────────────────────────────────────────────────┘%b\n' "$C_CYAN" "$C_NC"
@@ -2229,21 +2250,8 @@ interactive_menu() {
         [[ "${block_cn:-y}" =~ ^[Yy]$ ]] && args+=(--block-cn)
         menu_command install "${args[@]}"
         ;;
-      2)
-        printf '  1) vless-reality  2) hy2  3) naive  4) anytls  5) ss2022  6) socks\n'
-        local p=""
-        read -rp "请选择协议 [1-6]: " p
-        case "$p" in
-          1) menu_command add vless-reality ;;
-          2) menu_command add hy2 ;;
-          3) menu_command add naive ;;
-          4) menu_command add anytls ;;
-          5) menu_command add ss2022 ;;
-          6) menu_command add socks ;;
-          *) warn "无效选择" ;;
-        esac
-        ;;
-      3) menu_command modify ;;
+      2) menu_command add ;;
+      3) menu_command change ;;
       4)
         cmd_links
         local show_y=""
@@ -2256,36 +2264,36 @@ interactive_menu() {
         local ta=""
         read -rp "请选择 [1-4]: " ta
         case "$ta" in
-          1) menu_command tune --bw 500 --rtt auto ;;
+          1) menu_command bbr --bw 500 --rtt auto ;;
           2)
             local bw="" rtt=""
             read -rp "套餐带宽 Mbps [500]: " bw
             read -rp "参考 RTT ms [auto]: " rtt
-            menu_command tune --bw "${bw:-500}" --rtt "${rtt:-auto}"
+            menu_command bbr --bw "${bw:-500}" --rtt "${rtt:-auto}"
             ;;
           3)
-            menu_system_action tcpfit || warn "tcpfit 执行失败"
+            system_action tcpfit || warn "tcpfit 执行失败"
             ;;
-          4) menu_command tune --rollback ;;
+          4) menu_command bbr reset ;;
           *) warn "无效选择" ;;
         esac
         ;;
       7)
-        cmd_route status
+        cmd_route
         printf '  1) 开启回国阻断  2) 关闭回国阻断  3) 立即更新规则集  4) 添加放行域名  5) 添加拦截域名\n'
         local ra="" dom=""
         read -rp "请选择 [1-5，回车取消]: " ra
         case "$ra" in
-          1) menu_command route block-cn-on ;;
-          2) menu_command route block-cn-off ;;
-          3) menu_command route update ;;
+          1) menu_command cn on ;;
+          2) menu_command cn off ;;
+          3) menu_command cn update ;;
           4)
             read -rp "请输入要放行的域名后缀（如 example.cn）: " dom
-            [[ -n "$dom" ]] && menu_command route allow add "$dom"
+            [[ -n "$dom" ]] && menu_command allow "$dom"
             ;;
           5)
             read -rp "请输入要拦截的域名后缀（如 example.com）: " dom
-            [[ -n "$dom" ]] && menu_command route block add "$dom"
+            [[ -n "$dom" ]] && menu_command block "$dom"
             ;;
           "") ;;
           *) warn "无效选择" ;;
@@ -2296,21 +2304,21 @@ interactive_menu() {
         local sa=""
         read -rp "请选择 [1-4]: " sa
         case "$sa" in
-          1) menu_system_action start || warn "启动失败" ;;
-          2) menu_system_action stop || warn "停止失败" ;;
-          3) menu_system_action restart || warn "重启失败" ;;
+          1) system_action start || warn "启动失败" ;;
+          2) system_action stop || warn "停止失败" ;;
+          3) system_action restart || warn "重启失败" ;;
           4) [[ -f "${SB_LOG_DIR}/error.log" ]] && tail -n 30 "${SB_LOG_DIR}/error.log" || info "暂无错误日志" ;;
           *) warn "无效选择" ;;
         esac
         ;;
       9) cmd_audit || true ;;
       10)
-        printf '  1) 仅更新 sing-box 核心（失败自动回滚）  2) 按当前核心版本重建全部配置 (regen)\n'
+        printf '  1) 仅更新 sing-box 核心（失败自动回滚）  2) 按当前核心版本重建全部配置 (sb rebuild)\n'
         local ua=""
         read -rp "请选择 [1-2]: " ua
         case "$ua" in
           1) menu_command update ;;
-          2) menu_command regen ;;
+          2) menu_command rebuild ;;
           *) warn "无效选择" ;;
         esac
         ;;
@@ -2346,44 +2354,68 @@ main() (
 
   local sub="$1"
   shift
-  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  # Expand shortcuts before parsing help and arguments so both spellings
+  # reach the same command and locking checks.
+  case "$sub" in
+    a) sub=add ;;
+    c) sub=change ;;
+    i) sub=info ;;
+    d) sub=del ;;
+    s) sub=status ;;
+    r) sub=restart ;;
+    u) sub=update ;;
+    v|-v|--version) sub=version ;;
+    h|-h|--help) sub=help ;;
+  esac
+  if [[ $# == 1 && ( "$1" == -h || "$1" == --help ) ]]; then
     case "$sub" in
       add) cmd_add vless-reality "$1"; return ;;
-      route) route_help; return ;;
-      del|rm|sync|regen|update|up|uninstall|audit|check|links|link|url|yaml|clash)
-        show_help; return ;;
+      cn) route_help; return ;;
+      allow|block) echo "用法: sb $sub [域名] 或 sb $sub del <域名>"; return ;;
+      del|sync|rebuild|update|uninstall|check|info|clash|version|start|stop|restart|status) show_help; return ;;
     esac
   fi
 
   case "$sub" in
-    -h|--help|help)    show_help; return ;;
-    -v|--version|version) cmd_version; return ;;
-    sync)              cmd_sync "$@"; return ;;
-    uninstall)         cmd_uninstall "$@"; return ;;
-    install)           cmd_install "$@"; return ;;
-    add)               cmd_add "$@" ;;
-    modify|mod|edit)   cmd_modify "$@" ;;
-    links|link|url)    [[ $# -le 1 ]] || die "用法: sbctl links [meta-dir]"; cmd_links "$@"; return ;;
-    yaml|clash)        [[ $# -le 1 ]] || die "用法: sbctl yaml [meta-dir]"; cmd_yaml "$@"; return ;;
-    del|rm)            cmd_del "$@" ;;
-    tune|bbr)          cmd_tune "$@" ;;
-    route)             cmd_route "$@" ;;
-    audit|check)       [[ $# -eq 0 ]] || die "用法: sbctl audit"; cmd_audit; return ;;
-    update|up)         cmd_update "$@" ;;
-    regen)
-      [[ $# -eq 0 ]] || die "用法: sbctl regen"
+    help)               [[ $# == 0 ]] || die "用法: sb help"; show_help; return ;;
+    version)            [[ $# == 0 ]] || die "用法: sb version"; cmd_version; return ;;
+    sync)               cmd_sync "$@"; return ;;
+    uninstall)          cmd_uninstall "$@"; return ;;
+    install)            cmd_install "$@"; return ;;
+    add)                cmd_add "$@" ;;
+    change)             cmd_modify "$@" ;;
+    info)               [[ $# -le 1 && "${1:-}" != -* ]] || die "用法: sb info [目录]"; cmd_links "$@"; return ;;
+    clash)              [[ $# -le 1 && "${1:-}" != -* ]] || die "用法: sb clash [目录]"; cmd_yaml "$@"; return ;;
+    del)                cmd_del "$@" ;;
+    bbr)                cmd_tune "$@" ;;
+    cn)                 cmd_route "$@" ;;
+    allow|block)        cmd_domain_list "$sub" "$@" ;;
+    status)
+      [[ $# == 0 ]] || die "用法: sb status"
+      systemctl --no-pager --lines=0 status sing-box.service
+      return
+      ;;
+    start|stop|restart)
+      [[ $# == 0 ]] || die "用法: sb $sub"
+      system_action "$sub"
+      return
+      ;;
+    check)              [[ $# -eq 0 ]] || die "用法: sb check"; cmd_audit; return ;;
+    update)             cmd_update "$@" ;;
+    rebuild)
+      [[ $# -eq 0 ]] || die "用法: sb rebuild"
       need_root
       acquire_lock
       cmd_regen
       ;;
-    *) die "未知子命令: ${sub}（运行 sbctl --help 查看用法）" ;;
+    *) die "未知子命令: ${sub}（运行 sb --help 查看用法）" ;;
   esac
   local result=$?
   [[ "$result" -eq 0 ]] || return "$result"
   # Parsers acquire the write lock only for real changes. This also distinguishes
   # a dry run or help flag from a literal option value with the same spelling.
   if [[ "$SB_LOCK_HELD" == 1 ]] && is_staging_copy; then
-    ( install_self 1 ) || die "业务操作已完成，但 sbctl 同步失败。请重新运行 sbctl.sh sync。"
+    ( install_self 1 ) || die "业务操作已完成，但 sb 同步失败。请在源码目录重新运行 bash ./sbctl.sh sync。"
   fi
 )
 

@@ -44,7 +44,7 @@ initcwnd=$(ip -4 route show default 2>/dev/null | grep -oE 'initcwnd [0-9]+' | a
 if [[ "$cc" == "bbr" && "$qdisc" == "fq" ]]; then
   ok "拥塞控制=${cc}, qdisc=${qdisc}, initcwnd=${initcwnd:-默认}"
 else
-  warn "拥塞控制=${cc}, qdisc=${qdisc}（可运行 sbctl tune 启用 BBR+fq）"
+  warn "拥塞控制=${cc}, qdisc=${qdisc}（可运行 sb bbr 启用 BBR+fq）"
 fi
 if [[ -f /etc/sysctl.d/99-tcpfit.conf ]]; then
   ok "已由 tcpfit 纳管 (/etc/sysctl.d/99-tcpfit.conf)"
@@ -132,8 +132,8 @@ done
 
 hdr "6. 回国阻断路由与规则集状态"
 if [[ -f /etc/sing-box/config.json ]]; then
-  sbctl="$(dirname "${BASH_SOURCE[0]}")/../sbctl.sh"
-  if ! bash "$sbctl" route status; then
+  manager="$(dirname "${BASH_SOURCE[0]}")/../sbctl.sh"
+  if ! bash "$manager" cn; then
     warn "路由状态读取不完整，请检查上方错误。"
   fi
 fi

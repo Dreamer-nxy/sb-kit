@@ -36,7 +36,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart={cli} route update --quiet
+ExecStart={cli} cn update --quiet
 """.encode(),
         TIMER: b"""[Unit]
 Description=sb-kit weekly CN route rules update timer

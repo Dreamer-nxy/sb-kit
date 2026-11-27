@@ -769,6 +769,14 @@ def cmd_route_plan(args: argparse.Namespace) -> int:
 
 
 def cmd_route_domains(args: argparse.Namespace) -> int:
+    if args.action != "list":
+        try:
+            target = normalize_domain(args.domain)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if args.action == "validate":
+            return 0
     path = Path(args.file)
     try:
         current = load_domain_list(path)
@@ -780,15 +788,6 @@ def cmd_route_domains(args: argparse.Namespace) -> int:
         for dom in current:
             print(dom)
         return 0
-
-    if not args.domain:
-        print(f"ERROR: route-domains {args.action} requires a domain", file=sys.stderr)
-        return 1
-    try:
-        target = normalize_domain(args.domain)
-    except ValueError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
 
     if args.action == "add":
         if target not in current:
@@ -1545,7 +1544,7 @@ def cmd_yaml(args: argparse.Namespace) -> int:
         fields = _yaml_proxy(m)
         if fields is None:
             name = m.get("remark", m["tag"]).replace("\n", " ")
-            print(f"  # {name} ({m['proto']} 请直接导入 sbctl links 输出的链接)")
+            print(f"  # {name} ({m['proto']} 请直接导入 sb i 输出的链接)")
             continue
         for i, (key, value) in enumerate(fields):
             prefix = "  - " if i == 0 else "    "
@@ -1587,7 +1586,7 @@ def main() -> int:
 
     p_rdom = sub.add_parser("route-domains")
     p_rdom.add_argument("--file", required=True)
-    p_rdom.add_argument("action", choices=["list", "add", "del"])
+    p_rdom.add_argument("action", choices=["list", "add", "del", "validate"])
     p_rdom.add_argument("domain", nargs="?", default="")
 
     p_rstate = sub.add_parser("route-state")

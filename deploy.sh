@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sync the sbctl management tools to a remote VPS over SSH.
+# Sync the sb management tools to a remote VPS over SSH.
 set -euo pipefail
 
 usage() {
@@ -53,7 +53,7 @@ upload_command="cd '$REMOTE_STAGE' && tar -xzf - && chmod +x sbctl.sh lib/*.sh l
 COPYFILE_DISABLE=1 tar --no-xattrs --exclude='__pycache__' -C "$SCRIPT_DIR" -czf - sbctl.sh lib | \
   ssh -p "$SSH_PORT" -- "$TARGET" "$upload_command"
 
-echo "[+] 同步远端 /usr/local/bin/sbctl 与 /usr/local/lib/sb-kit..."
+echo "[+] 同步远端 /usr/local/bin/sb 与 /usr/local/lib/sb-kit..."
 
 # The remote shell owns normal cleanup, including a failed command or an SSH hangup.
 # The local trap covers upload failures and retries cleanup after a lost connection.

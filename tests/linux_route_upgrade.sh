@@ -5,7 +5,8 @@ set -euo pipefail
 version=${1:?usage: linux_route_upgrade.sh CORE_VERSION V0.2.2_SOURCE}
 legacy=${2:?missing v0.2.2 checkout}
 repo=$(cd "$(dirname "$0")/.." && pwd)
-ctl=/usr/local/bin/sbctl
+ctl=/usr/local/bin/sb
+legacy_ctl=/usr/local/bin/sbctl
 core=/usr/local/bin/sing-box
 config=/etc/sing-box
 base=$config/config.json
@@ -34,7 +35,7 @@ PY
 
 [[ $(id -u) == 0 && -d /run/systemd/system ]] || fail "requires a disposable root systemd VM"
 [[ $(bash "$legacy/sbctl.sh" --version) == 'sb-kit 0.2.2 ('* ]] || fail "wrong legacy checkout"
-for path in "$ctl" "$core" "$config" "$dropin" /usr/local/lib/sb-kit /var/lib/sing-box /var/log/sing-box; do
+for path in "$ctl" "$legacy_ctl" "$core" "$config" "$dropin" /usr/local/lib/sb-kit /var/lib/sing-box /var/log/sing-box; do
   [[ ! -e "$path" && ! -L "$path" ]] || fail "expected a clean VM; found $path"
 done
 for name in "$service" "$timer" "$unit"; do
@@ -46,7 +47,7 @@ trap 'rm -rf "$scratch"' EXIT
 echo "== Install the v0.2.2 release with its real geoip-cn policy"
 bash "$legacy/sbctl.sh" install --version "$version" --proto socks --port "$port" --ip 127.0.0.1 \
   --block-cn --no-tune --non-interactive >/dev/null
-[[ $("$ctl" --version) == "sb-kit 0.2.2 (sing-box: $version)" ]] && listening || fail "old installation not serving"
+[[ $("$legacy_ctl" --version) == "sb-kit 0.2.2 (sing-box: $version)" ]] && listening || fail "old installation not serving"
 [[ -s "$rules/geoip-cn.srs" && ! -e "$state" ]] || fail "missing genuine legacy policy"
 python3 - "$base" <<'PY'
 import json, sys
@@ -69,11 +70,12 @@ printf 'keep\n' >"$rules/operator-private.list"
 chmod 600 "$rules/operator-private.list"
 
 echo "== Upgrade the installed CLI without changing the active legacy policy"
-(cd "$repo" && "$ctl" sync)
+bash "$repo/sbctl.sh" sync
+[[ -x "$ctl" && ! -e "$legacy_ctl" && ! -L "$legacy_ctl" ]] || fail "CLI did not switch from sbctl to sb"
 cmp "$base" "$scratch/legacy.json"
 [[ $(systemctl show "$service" -p InvocationID --value) == "$invocation" ]] || fail "sync restarted the service"
-[[ $(mode) == legacy && $("$ctl" route status) == *"旧版 geoip-cn"* ]] || fail "legacy status not reported"
-"$ctl" route update --quiet
+[[ $(mode) == legacy && $("$ctl" cn) == *"旧版 geoip-cn"* ]] || fail "legacy status not reported"
+"$ctl" cn update --quiet
 cmp "$base" "$scratch/legacy.json"
 
 echo "== Fail a candidate start and verify restoration of the running legacy policy"
@@ -85,7 +87,7 @@ ExecStartPre=/bin/sh -c 'if test -f /var/lib/sing-box/.ci-route-fail-once; then 
 UNIT
 systemctl daemon-reload
 systemctl reset-failed "$service"
-if "$ctl" route update; then fail "accepted a failed migration"; fi
+if "$ctl" cn update; then fail "accepted a failed migration"; fi
 [[ ! -e "$marker" ]] || fail "the candidate never reached the injected start failure"
 cmp "$base" "$scratch/legacy.json"
 [[ $(mode) == legacy && $(sha256sum "$rules/geoip-cn.srs") == "$old_rule" ]] || fail "lost old rules"
@@ -99,7 +101,7 @@ systemctl daemon-reload
 systemctl reset-failed "$service"
 
 echo "== Migrate explicitly, check the pinned release, regenerate with custom settings"
-"$ctl" route update
+"$ctl" cn update
 [[ $(mode) == on ]] || fail "migration did not enable the targeted policy"
 commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["geosite_commit"])' "$state")
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "rules lack a full revision"
@@ -115,14 +117,15 @@ done <<< "$plan"
 [[ "$verified" == 21 ]] || fail "unexpected rule count $verified"
 echo "== Verified $verified installed rule files against upstream commit $commit"
 systemctl is-active --quiet "$timer" && systemctl is-enabled --quiet "$timer" || fail "weekly timer inactive"
+grep -Fxq "ExecStart=$ctl cn update --quiet" "/etc/systemd/system/$unit" || fail "weekly updater does not use sb"
 systemctl stop "$timer"
 systemctl is-enabled --quiet "$timer" || fail "stopping the timer changed its enablement"
-timer_status=$("$ctl" route status)
+timer_status=$("$ctl" cn)
 [[ "$timer_status" == *"运行=inactive"* && "$timer_status" == *"启用=enabled"* ]] || fail "enabled but stopped timer reported healthy"
 systemctl start "$timer"
-[[ $("$ctl" route status) == *"已启用并运行"* ]] || fail "active timer not reported healthy"
+[[ $("$ctl" cn) == *"已启用并运行"* ]] || fail "active timer not reported healthy"
 assert_custom_config
-"$ctl" regen >/dev/null
+"$ctl" rebuild >/dev/null
 assert_custom_config
 systemctl is-active --quiet "$service" && listening || fail "migration lost the listener"
 
@@ -132,19 +135,19 @@ systemctl start "$unit"
 [[ $(systemctl show -p Result --value "$unit") == success ]] || fail "updater service failed"
 if systemctl is-active --quiet "$service" || listening; then fail "weekly update started a stopped service"; fi
 assert_custom_config
-"$ctl" route allow add fixture.example >/dev/null
+"$ctl" allow fixture.example >/dev/null
 printf 'invalid domain with spaces\n' >"$rules/cn-allow.list"
 echo "== Disable routing with a malformed list and preserve the operator's edit"
-"$ctl" route off
-[[ $(mode) == off ]] || fail "route off left managed rules active"
-[[ $(cat "$rules/cn-allow.list") == 'invalid domain with spaces' ]] || fail "route off rewrote a malformed list"
+"$ctl" cn off
+[[ $(mode) == off ]] || fail "cn off left managed rules active"
+[[ $(cat "$rules/cn-allow.list") == 'invalid domain with spaces' ]] || fail "cn off rewrote a malformed list"
 assert_custom_config
 systemctl start "$service"
 [[ $(sha256sum "$config/meta/socks-$port.json") == "$node" ]] || fail "node credentials changed"
 
 echo "== Uninstall the upgraded kit and retain the operator's unrelated file"
 "$ctl" uninstall --keep-tcpfit >/dev/null
-for path in "$ctl" "$core" /usr/local/lib/sb-kit "$base" "$state" "$rules/$sample" "$rules/geoip-cn.srs"; do
+for path in "$ctl" "$legacy_ctl" "$core" /usr/local/lib/sb-kit "$base" "$state" "$rules/$sample" "$rules/geoip-cn.srs"; do
   [[ ! -e "$path" && ! -L "$path" ]] || fail "uninstall left $path"
 done
 for name in "$service" "$timer" "$unit"; do

@@ -13,11 +13,35 @@ BUNDLE = ROOT / "lib/bundle.py"
 
 
 class TestBundleCaches(unittest.TestCase):
+    def test_external_sb_is_never_claimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "lib"
+            cli = base / "bin/sb"
+            cli.parent.mkdir()
+            external = base / "external"
+            contents = b'#!/bin/sh\nSBKIT_VERSION="1.0"\n'
+            external.write_bytes(contents)
+            for kind in ("file", "link", "dangling"):
+                if kind == "file":
+                    cli.write_bytes(contents)
+                else:
+                    cli.symlink_to(external if kind == "link" else base / "missing")
+                for args in (("publish", ROOT, root, cli), ("uninstall", root, cli)):
+                    result = subprocess.run([sys.executable, BUNDLE, *args], capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertTrue(os.path.lexists(cli))
+                    self.assertEqual(external.read_bytes(), contents)
+                if kind == "file":
+                    self.assertEqual(cli.read_bytes(), contents)
+                cli.unlink()
+            self.assertFalse(root.exists())
+
     def test_cache_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             installed = base / "lib"
-            cli = base / "bin/sbctl"
+            cli = base / "bin/sb"
             subprocess.run([sys.executable, BUNDLE, "publish", ROOT, installed, cli], check=True)
             lib = (installed / "VERSION").resolve().parent / "lib"
             cache = lib / "__pycache__"

@@ -9,9 +9,9 @@ mkdir -p "$work/local/bin" "$work/local/lib" "$work/hooks" "$work/empty"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 assert_pair() {
-  local expected=$1
-  [[ $(/usr/local/bin/sbctl --version) == "sb-kit $expected (sing-box: 未安装)" ]] || fail "CLI should be $expected"
-  [[ $(/usr/local/bin/sbctl audit) == "helper-$expected" ]] || fail "helper should be $expected"
+  local expected=$1 entry=${2:-/usr/local/bin/sb}
+  [[ $("$entry" --version) == "sb-kit $expected (sing-box: 未安装)" ]] || fail "CLI should be $expected"
+  [[ $("$entry" check) == "helper-$expected" ]] || fail "helper should be $expected"
   [[ $(cat /usr/local/lib/sb-kit/VERSION) == "$expected" ]] || fail "VERSION should be $expected"
 }
 
@@ -26,7 +26,7 @@ interrupt_sync() {
 }
 
 run_tests() {
-  local ctl=/usr/local/bin/sbctl lib=/usr/local/lib/sb-kit version checkout
+  local ctl=/usr/local/bin/sb old=/usr/local/bin/sbctl lib=/usr/local/lib/sb-kit version checkout
   mkdir -p "$lib"
   for version in 91.0.1 91.0.2; do
     checkout="$work/$version"
@@ -46,22 +46,27 @@ run_tests() {
   mkdir -p "${ctl%/*}" "$lib"
   printf '90.0.0\n' >"$lib/VERSION"
   printf '#!/bin/sh\necho helper-90.0.0\n' >"$lib/audit.sh"
-  cat >"$ctl" <<'LEGACY'
+  cat >"$old" <<'LEGACY'
 #!/bin/sh
+# sbctl.sh - sing-box flat release fixture
 SBKIT_VERSION="90.0.0"
 case "$1" in
   --version) echo "sb-kit $SBKIT_VERSION (sing-box: 未安装)" ;;
-  audit) exec bash /usr/local/lib/sb-kit/audit.sh ;;
+  check) exec bash /usr/local/lib/sb-kit/audit.sh ;;
   *) exit 2 ;;
 esac
 LEGACY
-  chmod 755 "$ctl"
+  chmod 755 "$old"
 
-  assert_pair 90.0.0
+  assert_pair 90.0.0 "$old"
+  interrupt_sync "$work/91.0.1" "$old" kill-after
+  assert_pair 90.0.0 "$old"
   interrupt_sync "$work/91.0.1" "$ctl" kill-after
-  assert_pair 90.0.0
+  assert_pair 91.0.1
   (cd "$work/empty" && bash "$work/91.0.1/sbctl.sh" sync)
   assert_pair 91.0.1
+  [[ ! -e "${old%/*}/.sbctl.sb-kit-publish-work" ]] || fail "rename left a publication workspace"
+  [[ ! -e "$old" && ! -L "$old" ]] || fail "old CLI not retired"
 
   interrupt_sync "$work/91.0.2" "$lib/VERSION" fail-before
   assert_pair 91.0.1
@@ -104,5 +109,10 @@ export -f run_tests interrupt_sync assert_pair fail
 unshare --mount --propagation private bash -euc '
   mount --bind "$work/local" /usr/local
   mount -t tmpfs tmpfs /run
+  # Lock acquisition also recovers any pending route transaction. Do not read
+  # or recover a transaction from the host where this test is being run.
+  for path in /etc/sing-box /etc/systemd/system; do
+    if [[ -d "$path" ]]; then mount -t tmpfs tmpfs "$path"; fi
+  done
   run_tests
 '

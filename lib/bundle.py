@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a matched sbctl entry point and helpers with a single active-version pointer."""
+"""Publish a matched sb entry point and helpers with a single active-version pointer."""
 
 import hashlib
 import importlib.util
@@ -244,21 +244,56 @@ def is_flat_script(data):
     return bool(VERSION_LINE.search(data)) or b"# sbctl.sh " in data[:100] and b"sing-box" in data[:140]
 
 
-def publish(source, root, cli):
-    if (root.is_symlink() or (root / "releases").is_symlink() or
-            (cli.is_symlink() and not is_release_launcher(cli, root))):
-        raise ValueError("安装目录或入口为外部符号链接")
+def check_cli(root, cli):
+    if root.is_symlink() or (root / "releases").is_symlink():
+        raise ValueError("安装目录指向外部文件")
+    if not os.path.lexists(cli):
+        return
+    launcher = launcher_bytes(root / "VERSION", legacy_name(cli.with_name("sbctl")))
+    if (not is_release_launcher(cli, root)
+            or (cli.exists() and (not cli.is_file() or cli.read_bytes() != launcher))):
+        raise ValueError(f"命令路径已被其他程序占用: {cli}")
+
+
+def owns_previous_entry(root, cli, launcher):
+    """Only retire the previous name when both the entry and installed layout match."""
+    marker = root / "VERSION"
+    if not cli.is_file() or (cli.is_symlink() and not is_release_launcher(cli, root)):
+        return False
+    data = cli.read_bytes()
+    if marker.is_symlink():
+        return data == launcher and bool(RELEASE_LINK.fullmatch(os.readlink(marker)))
+    if marker.is_file() and not cli.is_symlink():
+        # A killed flat-layout migration may have installed its fallback launcher.
+        if data == launcher:
+            saved = legacy_name(cli)
+            if saved.is_symlink() or not saved.is_file():
+                return False
+            data = saved.read_bytes()
+        version = VERSION_LINE.search(data)
+        return (b"# sbctl.sh " in data[:100] and b"sing-box" in data[:140]
+                and version is not None and marker.read_bytes().strip() == version[1])
+    return False
+
+
+def publish(source, root, new_cli):
+    check_cli(root, new_cli)
+    old_cli = new_cli.with_name("sbctl")
+    marker = root / "VERSION"
+    legacy = legacy_name(old_cli)
+    launcher = launcher_bytes(marker, legacy)
+    # During a rename, the old entry stays callable until the new entry is ready.
+    cli = old_cli if not os.path.lexists(new_cli) and owns_previous_entry(root, old_cli, launcher) else new_cli
     releases = root / "releases"
     releases.mkdir(parents=True, exist_ok=True)
     flush_path(root)
     flush_path(root.parent)
-    marker = root / "VERSION"
     if marker.is_symlink() and not RELEASE_LINK.fullmatch(os.readlink(marker)):
         raise ValueError(f"VERSION 指向外部文件: {marker}")
     cli.parent.mkdir(parents=True, exist_ok=True)
-    legacy = legacy_name(cli)
-    launcher = launcher_bytes(marker, legacy)
-    work, bin_work = work_dirs(root, cli)
+    # Keep the same recovery paths across the entry rename, including a crash
+    # immediately after the new link appears and before the old one is retired.
+    work, bin_work = work_dirs(root, old_cli)
     open_work(work)
     try:
         open_work(bin_work)
@@ -296,6 +331,11 @@ def publish(source, root, cli):
                 atomic_file(cli, launcher, 0o755, bin_work)
             if not marker.is_symlink() or os.readlink(marker) != relative:
                 switch_link(marker, relative, work)
+        if cli != new_cli:
+            switch_link(new_cli, release / ".sb-kit-launcher", bin_work)
+        if old_cli != new_cli and owns_previous_entry(root, old_cli, launcher):
+            old_cli.unlink()
+            flush_path(old_cli.parent)
         return version
     finally:
         clean_work(work)
@@ -303,15 +343,13 @@ def publish(source, root, cli):
 
 
 def uninstall(root, cli):
-    for work in work_dirs(root, cli):
+    check_cli(root, cli)
+    for work in work_dirs(root, cli.with_name("sbctl")):
         clean_work(work)
     marker = root / "VERSION"
     if not marker.is_symlink() or not RELEASE_LINK.fullmatch(os.readlink(marker)):
         return
-    legacy = legacy_name(cli)
-    if ((cli.is_symlink() and not is_release_launcher(cli, root)) or
-            (cli.exists() and cli.read_bytes() != launcher_bytes(marker, legacy))):
-        raise ValueError(f"sbctl 入口已被替换: {cli}")
+    legacy = legacy_name(cli.with_name("sbctl"))
     if legacy.exists() and not legacy.is_symlink() and is_flat_script(legacy.read_bytes()):
         legacy.unlink()
     releases = root / "releases"
@@ -333,16 +371,20 @@ def uninstall(root, cli):
         remove_empty(release / "lib")
         remove_empty(release)
     remove_empty(releases)
+    if is_release_launcher(cli, root):
+        cli.unlink()
 
 
 def main(argv):
     try:
         if len(argv) == 5 and argv[1] == "publish":
             print(publish(*(Path(value).absolute() for value in argv[2:])))
+        elif len(argv) == 4 and argv[1] == "check-cli":
+            check_cli(*(Path(value).absolute() for value in argv[2:]))
         elif len(argv) == 4 and argv[1] == "uninstall":
             uninstall(*(Path(value).absolute() for value in argv[2:]))
         else:
-            raise ValueError("usage: bundle.py publish SOURCE LIB_ROOT CLI | uninstall LIB_ROOT CLI")
+            raise ValueError("usage: bundle.py publish SOURCE LIB_ROOT CLI | check-cli LIB_ROOT CLI | uninstall LIB_ROOT CLI")
     except (OSError, ValueError, SyntaxError, subprocess.CalledProcessError) as exc:
         print(f"sb-kit: {exc}", file=sys.stderr)
         return 1

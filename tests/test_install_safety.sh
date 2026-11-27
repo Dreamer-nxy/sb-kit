@@ -33,11 +33,24 @@ set_paths() {
   SB_DIR="$base/etc/sing-box"; SB_CONFIG="$SB_DIR/config.json"; SB_CONF_DIR="$SB_DIR/conf"
   SB_META_DIR="$SB_DIR/meta"; SB_RULES_DIR="$SB_DIR/rules"; SB_STATE_DIR="$base/state"; SB_LOG_DIR="$base/logs"
   SB_UNIT="$base/units/sing-box.service"; SB_LOGROTATE="$base/rotate"; SB_BIN="$base/bin/sing-box"
-  SB_CTL_DST="$base/bin/sbctl"; SB_LIB_DST="$base/lib"; SB_BACKUP_ROOT="$base/backups"; NFT_DIR="$base/nft"
+  SB_CTL_DST="$base/bin/sb"; SB_LIB_DST="$base/lib"; SB_BACKUP_ROOT="$base/backups"; NFT_DIR="$base/nft"
   TCPFIT_BIN="$base/bin/tcpfit"; PRE_INSTALL_BACKUP=""
   mkdir -p "$base/bin" "$base/units"
   rm -f "$WORK/fragment" "$WORK/route-bus-failed" "$WORK/route-fragment" "$WORK/route-dropins" "$WORK/is-active" "$WORK/is-enabled"
 }
+
+# A package-provided sb elsewhere on PATH must not be shadowed by the installer.
+set_paths cli_conflict
+mkdir -p "$WORK/path"
+printf '#!/bin/sh\nexit 0\n' >"$WORK/path/sb"
+chmod 755 "$WORK/path/sb"
+if (export PATH="$WORK/path:$PATH"; check_cli_name) >/dev/null 2>&1; then
+  fail "accepted another sb on PATH"
+fi
+[[ ! -e "$SB_CTL_DST" ]] || fail "published sb despite PATH conflict"
+# A previous installation's active updater would invoke a retired command.
+echo "ExecStart=${SB_CTL_DST%/*}/sbctl route update --quiet" >"${SB_UNIT%/*}/sbkit-rules-update.service"
+if (check_cli_name) >/dev/null 2>&1; then fail "accepted an updater that still calls sbctl"; fi
 
 # The real GitHub response exceeds Linux's per-argument limit.
 set_paths release
@@ -190,7 +203,7 @@ touch "$SB_RULES_DIR/operator-custom.srs"
 ensure_base_config on 1 1
 [[ -f "$SB_RULES_DIR/route-state.json" && -f "$SB_RULES_DIR/geosite-category-netdisk-cn.srs" ]] || fail "CN block rules not installed"
 [[ -f "${SB_UNIT%/*}/sbkit-rules-update.timer" && -f "${SB_UNIT%/*}/sbkit-rules-update.service" ]] || fail "rules update timer not installed"
-cmd_route allow add example.cn >/dev/null
+cmd_domain_list allow example.cn >/dev/null
 [[ -f "$SB_RULES_DIR/cn-allow.list" ]] || fail "custom allowlist not written"
 cmd_uninstall --keep-tcpfit
 [[ ! -e "${SB_UNIT%/*}/sbkit-rules-update.timer" && ! -e "${SB_UNIT%/*}/sbkit-rules-update.service" ]] || fail "rules update timer survived uninstall"
@@ -224,7 +237,7 @@ custom="$SB_RULES_DIR/geosite-category-netdisk-cn.srs"
 echo operator >"$custom"; chmod 600 "$custom"
 echo operator >"$SB_RULES_DIR/geoip-cn.srs"
 echo example.net >"$SB_RULES_DIR/cn-allow.list"
-if cmd_route allow add new.example.net; then fail "overwrote untracked domain list"; fi
+if cmd_domain_list allow new.example.net; then fail "overwrote untracked domain list"; fi
 fix_runtime_perms
 python3 - "$custom" <<'PYMODE'
 import os, stat, sys
@@ -273,7 +286,7 @@ PYFORMAT
   printf '# handwritten\nExample.net\n' >"$custom"
   chmod 600 "$custom"
   if [[ "$first" == upgrade ]]; then ensure_base_config off 0 1; fi
-  cmd_route allow add new.example.net >/dev/null
+  cmd_domain_list allow new.example.net >/dev/null
   grep -Fxq new.example.net "$custom" || fail "legacy list could not be edited"
   if [[ "$first" == changed ]]; then echo operator-edited >"$custom"; fi
   cmd_uninstall --keep-tcpfit
