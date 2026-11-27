@@ -99,7 +99,12 @@ class TestSbKitConfigGen(unittest.TestCase):
         )
         cfg_on = json.loads(out_on.read_text(encoding="utf-8"))
         rs_tags = [rs["tag"] for rs in cfg_on["route"]["rule_set"]]
-        self.assertEqual(len(rs_tags), len(config_gen.CN_BLOCK_GEOSITE_TAGS))
+        self.assertEqual(len([tag for tag in rs_tags if tag.startswith("geosite-")]), len(config_gen.CN_BLOCK_GEOSITE_TAGS))
+        inline = {r["tag"]: r["rules"][0]["domain_suffix"] for r in cfg_on["route"]["rule_set"] if r["type"] == "inline"}
+        self.assertEqual(inline["sbkit-cn-user-allow"], ["example.cn"])
+        self.assertEqual(inline["sbkit-cn-user-block"], ["bad.example.com"])
+        self.assertIn("feishu.cn", inline["sbkit-cn-builtin-allow"])
+        self.assertIn("gov.cn", inline["sbkit-cn-extra-block"])
         self.assertIn("geosite-category-netdisk-cn", rs_tags)
         self.assertIn("geosite-icbc", rs_tags)
         self.assertNotIn("geoip-cn", rs_tags)
@@ -107,16 +112,16 @@ class TestSbKitConfigGen(unittest.TestCase):
 
         rules_on = cfg_on["route"]["rules"]
         self.assertFalse(any(r.get("action") == "resolve" for r in rules_on))
-        idx_user_allow = next(i for i, r in enumerate(rules_on) if r.get("domain_suffix") == ["example.cn"])
-        idx_user_block = next(i for i, r in enumerate(rules_on) if r.get("domain_suffix") == ["bad.example.com"])
+        idx_user_allow = next(i for i, r in enumerate(rules_on) if r.get("rule_set") == ["sbkit-cn-user-allow"])
+        idx_user_block = next(i for i, r in enumerate(rules_on) if r.get("rule_set") == ["sbkit-cn-user-block"])
         idx_builtin_allow = next(
             i for i, r in enumerate(rules_on)
-            if r.get("action") == "route" and "feishu.cn" in r.get("domain_suffix", [])
+            if r.get("action") == "route" and r.get("rule_set") == ["sbkit-cn-builtin-allow"]
         )
         idx_rs_block = next(i for i, r in enumerate(rules_on) if "geosite-bilibili" in r.get("rule_set", []))
         idx_extra_block = next(
             i for i, r in enumerate(rules_on)
-            if r.get("action") == "reject" and "gov.cn" in r.get("domain_suffix", [])
+            if r.get("action") == "reject" and r.get("rule_set") == ["sbkit-cn-extra-block"]
         )
         self.assertLess(idx_user_allow, idx_user_block)
         self.assertLess(idx_user_block, idx_builtin_allow)
@@ -137,6 +142,168 @@ class TestSbKitConfigGen(unittest.TestCase):
         run_gen("route-domains", "--file", str(allow_file), "del", "example.cn")
         self.assertEqual(run_gen("route-domains", "--file", str(allow_file), "list").stdout.strip(), "")
         self.assertNotEqual(run_gen("route-domains", "--file", str(allow_file), "del", "example.cn", check=False).returncode, 0)
+
+    def test_route_plan_revision(self) -> None:
+        commit = "0123456789abcdef" * 2 + "01234567"
+        lines = run_gen("route-plan", "--mode", "on", "--commit", commit).stdout.splitlines()
+        self.assertEqual(len(lines), 21)
+        self.assertTrue(all(f"/{commit}/" in line for line in lines))
+        self.assertNotEqual(run_gen("route-plan", "--mode", "on", "--commit", "main", check=False).returncode, 0)
+
+    def test_merge_custom_base_and_ignore_bad_list_when_disabled(self) -> None:
+        tmp = Path(self.tmp.name)
+        config, rules, allow, block = tmp / "config.json", tmp / "rules", tmp / "allow", tmp / "block"
+        allow.write_text("example.org\n")
+        block.write_text("blocked.example.org\n")
+        existing = ("--existing-config", str(config), "--existing-rules-dir", str(rules))
+        self.assertEqual(run_gen("route-mode", "--config", str(config), "--rules-dir", str(rules)).stdout.strip(), "off")
+        custom = {
+            "log": {"level": "warn", "timestamp": False},
+            "dns": {"servers": [{"type": "local", "tag": "custom-dns"}]},
+            "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "direct", "tag": "custom-out"}],
+            "route": {"final": "custom-out", "default_domain_resolver": "custom-dns", "rules": [
+                {"domain_suffix": ["private.example"], "action": "route", "outbound": "custom-out"}],
+                "rule_set": [{"type": "inline", "tag": "local-set", "rules": [{"domain": ["custom.example"]}]}]},
+        }
+        config.write_text(json.dumps(custom))
+        on = ("base-config", "--out", str(config), "--cn-mode", "on", "--rules-dir", str(rules),
+              "--allow-file", str(allow), "--block-file", str(block), *existing)
+        run_gen(*on)
+        first = json.loads(config.read_text())
+        self.assertEqual(run_gen("route-mode", "--config", str(config), "--rules-dir", str(rules)).stdout.strip(), "on")
+        before_category = first["route"]["rules"].index(config_gen.cn_action({"rule_set": ["sbkit-cn-builtin-allow"]}, "route"))
+        interleaved = {"domain_suffix": ["user.example"], "action": "reject"}
+        first["route"]["rules"].insert(before_category, interleaved)
+        config.write_text(json.dumps(first))
+        run_gen(*on)
+        self.assertEqual(json.loads(config.read_text()), first)
+        block.write_text("not.*.a.domain")
+        previous = config.read_bytes()
+        self.assertNotEqual(run_gen(*on, check=False).returncode, 0)
+        self.assertEqual(config.read_bytes(), previous)
+        run_gen("base-config", "--cn-mode", "off", "--out", str(config), "--block-file", str(block), *existing)
+        custom["route"]["rules"].insert(0, interleaved)
+        self.assertEqual(json.loads(config.read_text()), custom)
+
+    def test_migrate_unmarked_v030_policy_with_adjacent_custom_rules(self) -> None:
+        tmp = Path(self.tmp.name)
+        cfg, rules_dir, allow, block = tmp / "config.json", tmp / "rules", tmp / "allow", tmp / "block"
+        allow.write_text("allow.example\n")
+        block.write_text("block.example\n")
+        custom = {"domain_suffix": ["operator.example"], "action": "reject"}
+        plan = config_gen.route_plan_for_mode("on")
+        old_user_rules = [
+            config_gen.cn_action({"domain_suffix": ["allow.example"]}, "route"),
+            config_gen.cn_action({"domain_suffix": ["block.example"]}, "reject"),
+        ]
+        builtin_rules = [
+            config_gen.cn_action({"domain_suffix": list(config_gen.CN_ALLOW_DOMAINS)}, "route"),
+            config_gen.cn_action({"rule_set": [tag for tag, _, _ in plan]}, "reject"),
+            config_gen.cn_action({"domain_suffix": list(config_gen.CN_BLOCK_EXTRA_DOMAINS)}, "reject"),
+        ]
+        original = {"route": {
+            "rule_set": [config_gen.cn_local_set(tag, rules_dir / fn) for tag, fn, _ in plan],
+            "rules": list(config_gen.BASE_RULES) + old_user_rules + [custom] + builtin_rules,
+        }}
+        cfg.write_text(json.dumps(original))
+        off = ("base-config", "--cn-mode", "off", "--out", str(cfg), "--existing-config", str(cfg),
+               "--old-allow-file", str(allow), "--old-block-file", str(block))
+        run_gen(*off)
+        self.assertEqual(json.loads(cfg.read_text())["route"]["rules"], config_gen.BASE_RULES + [custom])
+        original["route"]["rules"] = list(config_gen.BASE_RULES) + old_user_rules + builtin_rules + [custom]
+        cfg.write_text(json.dumps(original))
+        block.write_text("block.example\nfoo.*.example")
+        run_gen(*off)
+        self.assertEqual(json.loads(cfg.read_text())["route"]["rules"], config_gen.BASE_RULES + [custom])
+
+    def test_preserve_duplicate_operator_rule_and_its_rule_sets(self) -> None:
+        tmp = Path(self.tmp.name)
+        cfg, rules_dir = tmp / "config.json", tmp / "rules"
+        run_gen("base-config", "--out", str(cfg), "--cn-mode", "on", "--rules-dir", str(rules_dir))
+        data = json.loads(cfg.read_text())
+        plan = config_gen.route_plan_for_mode("on")
+        categories = [tag for tag, _, _ in plan]
+        operator_rule = {"rule_set": categories, "action": "reject"}
+        data["route"]["rules"].insert(0, operator_rule)
+        custom_suffixes = config_gen.cn_action({"domain_suffix": list(config_gen.CN_ALLOW_DOMAINS)}, "route")
+        data["route"]["rules"].append(custom_suffixes)
+        data["route"]["rules"].append(custom_suffixes)
+        cfg.write_text(json.dumps(data))
+        args = ("base-config", "--out", str(cfg), "--existing-config", str(cfg), "--rules-dir", str(rules_dir))
+        run_gen(*args, "--cn-mode", "on")
+        self.assertEqual(json.loads(cfg.read_text()), data)
+        run_gen(*args, "--cn-mode", "off")
+        self.assertEqual(json.loads(cfg.read_text())["route"]["rules"],
+                         [operator_rule] + config_gen.BASE_RULES + [custom_suffixes, custom_suffixes])
+        self.assertEqual(run_gen("route-mode", "--config", str(cfg), "--rules-dir", str(rules_dir)).stdout.strip(), "off")
+        self.assertEqual([r["tag"] for r in json.loads(cfg.read_text())["route"]["rule_set"]], categories)
+        run_gen(*args, "--cn-mode", "on")
+        self.assertEqual(json.loads(cfg.read_text()), data)
+
+    def test_timer_status_displays_systemd_state(self) -> None:
+        snapshot = Path(self.tmp.name) / "unit.properties"
+        # The stub returns the same property record as systemctl show.
+        query = 'source "$1"; snapshot="$2"; systemctl() { cat "$snapshot"; }; route_timer_status'
+        for active, enabled, expected in (
+            ("active", "enabled", "已启用并运行"), ("inactive", "enabled", "需修复"),
+            ("active", "disabled", "需修复"), ("inactive", "disabled", "需修复"),
+        ):
+            snapshot.write_text(f"LoadState=loaded\nActiveState={active}\nUnitFileState={enabled}\n")
+            result = subprocess.run(["bash", "-c", query, "_", str(ROOT / "sbctl.sh"), str(snapshot)],
+                                    capture_output=True, text=True, check=True)
+            self.assertIn(expected, result.stdout)
+        snapshot.write_text("LoadState=loaded\n")
+        result = subprocess.run(["bash", "-c", query, "_", str(ROOT / "sbctl.sh"), str(snapshot)],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_status_formats_legacy_and_pinned_versions(self) -> None:
+        tmp = Path(self.tmp.name)
+        cfg, rules = tmp / "config.json", tmp / "rules"
+        rules.mkdir()
+        run_gen("base-config", "--out", str(cfg), "--cn-mode", "on", "--rules-dir", str(rules))
+        shell = ('source "$1"; SB_CONFIG="$2"; SB_RULES_DIR="$3"; need_root() { :; }; '
+                 'systemctl() { printf "%s\n" LoadState=loaded ActiveState=inactive UnitFileState=enabled; }; '
+                 'cmd_route status')
+        for version, label in (("abcd1234abcd", "未经固定"), ("a" * 40, "已固定")):
+            run_gen("route-state", "--file", str(rules / "route-state.json"), "set",
+                    "--mode", "on", "--geosite-commit", version)
+            result = subprocess.run(["bash", "-c", shell, "_", str(ROOT / "sbctl.sh"), str(cfg), str(rules)],
+                                    capture_output=True, text=True, check=True)
+            self.assertIn(label, result.stdout)
+            self.assertIn("运行=inactive, 启用=enabled", result.stdout)
+        cfg.write_text("not JSON")
+        quiet = 'source "$1"; SB_CONFIG="$2"; SB_RULES_DIR="$3"; need_root() { :; }; acquire_lock() { :; }; cmd_route update --quiet'
+        result = subprocess.run(["bash", "-c", quiet, "_", str(ROOT / "sbctl.sh"), str(cfg), str(rules)],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ERROR", result.stderr)
+
+    def test_legacy_mode_requires_managed_path_and_use(self) -> None:
+        tmp = Path(self.tmp.name)
+        config, rules = tmp / "config.json", tmp / "rules"
+        mode = ("route-mode", "--config", str(config), "--rules-dir", str(rules))
+        base = {"route": {"rules": [{"rule_set": ["geoip-cn"], "action": "reject"}],
+                          "rule_set": [config_gen.cn_local_set("geoip-cn", rules / "geoip-cn.srs")]}}
+        config.write_text(json.dumps(base))
+        self.assertEqual(run_gen(*mode).stdout.strip(), "legacy")
+        formatted = json.loads(json.dumps(base))
+        formatted["route"]["rule_set"][0].pop("format")
+        formatted["route"]["rules"][0]["rule_set"] = "geoip-cn"
+        config.write_text(json.dumps(formatted))
+        self.assertEqual(run_gen(*mode).stdout.strip(), "legacy")
+        run_gen("base-config", "--out", str(config), "--cn-mode", "on", "--rules-dir", str(rules), "--existing-config", str(config))
+        self.assertEqual(run_gen(*mode).stdout.strip(), "on")
+        self.assertNotIn('"geoip-cn"', config.read_text())
+        base["route"]["rule_set"][0]["path"] = str(tmp / "operator" / "geoip-cn.srs")
+        config.write_text(json.dumps(base))
+        self.assertEqual(run_gen(*mode).stdout.strip(), "off")
+        run_gen("base-config", "--out", str(config), "--existing-config", str(config))
+        self.assertEqual(json.loads(config.read_text()), base)
+        base["route"]["rule_set"][0]["path"] = str(rules / "geoip-cn.srs")
+        base["route"]["rules"][0]["port"] = 80
+        config.write_text(json.dumps(base))
+        self.assertEqual(run_gen(*mode).stdout.strip(), "off")
 
     def test_vless_reality_real_x25519_perms_and_modify(self) -> None:
         res = run_gen(

@@ -2,6 +2,7 @@
 """Publish a matched sbctl entry point and helpers with a single active-version pointer."""
 
 import hashlib
+import importlib.util
 import os
 import re
 import shlex
@@ -10,7 +11,7 @@ import sys
 from pathlib import Path
 
 
-REQUIRED = {"audit.sh", "bundle.py", "config_gen.py", "managed_files.py", "sni_probe.py"}
+REQUIRED = {"audit.sh", "bundle.py", "config_gen.py", "managed_files.py", "route_ownership.py", "route_transaction.py", "sni_probe.py"}
 VERSION_LINE = re.compile(rb'^SBKIT_VERSION="([0-9][0-9A-Za-z.+_-]*)"$', re.MULTILINE)
 RELEASE_LINK = re.compile(r"releases/([a-f0-9]{64})/VERSION\Z")
 COMPONENT = re.compile(r"[A-Za-z0-9_.-]+\.(?:py|sh)\Z")
@@ -40,6 +41,31 @@ def safe_member(rel):
 def remove_empty(path):
     if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
         path.rmdir()
+
+
+def remove_generated_caches(source):
+    """Older installed helpers imported each other without disabling Python bytecode."""
+    cache_dir = source.parent / "__pycache__"
+    if cache_dir.is_symlink() or not cache_dir.is_dir():
+        return
+    stat = source.stat()
+    mtime = (int(stat.st_mtime) & 0xffffffff).to_bytes(4, "little")
+    size = (stat.st_size & 0xffffffff).to_bytes(4, "little")
+    pattern = re.compile(re.escape(source.stem) + r"\.cpython-\d+(?:\.opt-[12])?\.pyc")
+    for cache in cache_dir.iterdir():
+        if cache.is_symlink() or not cache.is_file() or not pattern.fullmatch(cache.name):
+            continue
+        with cache.open("rb") as stream:
+            header = stream.read(16)
+        if len(header) != 16 or header[2:4] != b"\r\n":
+            continue
+        flags = int.from_bytes(header[4:8], "little")
+        if flags == 0 and header[8:] == mtime + size:
+            cache.unlink()
+        elif (flags in (1, 3) and header[:4] == importlib.util.MAGIC_NUMBER
+              and header[8:] == importlib.util.source_hash(source.read_bytes())):
+            cache.unlink()
+    remove_empty(cache_dir)
 
 
 def clean_work(work):
@@ -300,6 +326,8 @@ def uninstall(root, cli):
             continue  # A directory without our intact content-addressed manifest is not owned.
         for path, digest in entries:
             if not path.is_symlink() and path.is_file() and sha(path.read_bytes()) == digest:
+                if path.suffix == ".py" and not path.parent.is_symlink():
+                    remove_generated_caches(path)
                 path.unlink()
         (release / MANIFEST).unlink()
         remove_empty(release / "lib")

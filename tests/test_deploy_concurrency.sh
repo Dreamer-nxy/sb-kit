@@ -11,6 +11,7 @@ export PATH="$work/bin:$PATH"
 cat >"$work/bin/ssh" <<'SSH'
 #!/usr/bin/env bash
 set -euo pipefail
+touch "$DEPLOY_TEST_EVENTS/ssh-called"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|-t) shift ;;
@@ -73,7 +74,19 @@ wait_for_entry() {
 }
 
 target=root@test-host:2222
-WAIT_FOR_RELEASE=1 bash "$work/first/deploy.sh" "$target" show "a b" "it's \$5" "" >"$work/first.log" 2>&1 &
+assert_usage_error() {
+  local rc=0
+  bash "$work/first/deploy.sh" "$@" >"$work/usage.log" 2>&1 || rc=$?
+  [[ "$rc" == 2 && ! -e "$DEPLOY_TEST_EVENTS/ssh-called" ]]
+  grep -Fq 'https://github.com/Dreamer-nxy/sb-kit' "$work/usage.log"
+}
+assert_usage_error
+assert_usage_error "$target"
+assert_usage_error "$target" install
+assert_usage_error "$target" menu
+assert_usage_error "$target" sync install
+
+WAIT_FOR_RELEASE=1 bash "$work/first/deploy.sh" "$target" sync >"$work/first.log" 2>&1 &
 first_pid=$!
 wait_for_entry first
 WAIT_FOR_RELEASE=1 bash "$work/second/deploy.sh" "$target" sync >"$work/second.log" 2>&1 &
@@ -82,19 +95,19 @@ wait_for_entry second
 first_stage=$(cat "$DEPLOY_TEST_EVENTS/first.stage")
 second_stage=$(cat "$DEPLOY_TEST_EVENTS/second.stage")
 [[ "$first_stage" != "$second_stage" && -d "$first_stage" && -d "$second_stage" ]]
-printf '%s\0' show "a b" "it's \$5" "" | cmp - "$DEPLOY_TEST_EVENTS/first.argv"
+printf '%s\0' sync | cmp - "$DEPLOY_TEST_EVENTS/first.argv"
 printf '%s\0' sync | cmp - "$DEPLOY_TEST_EVENTS/second.argv"
 touch "$DEPLOY_TEST_EVENTS/first.release"
 wait "$first_pid"
 [[ ! -e "$first_stage" && $(cat "$second_stage/lib/payload") == second ]]
 
-# A failed upload or failed menu command must clean only its own directory and
+# A failed upload or failed sync command must clean only its own directory and
 # report its own exit status, even while a different deploy is still running.
 rc=0
 FAIL_UPLOAD=1 bash "$work/first/deploy.sh" "$target" sync >"$work/upload.log" 2>&1 || rc=$?
 [[ "$rc" == 42 ]]
 rc=0
-COMMAND_RC=37 bash "$work/first/deploy.sh" "$target" >"$work/menu.log" 2>&1 || rc=$?
+COMMAND_RC=37 bash "$work/first/deploy.sh" "$target" sync >"$work/sync.log" 2>&1 || rc=$?
 [[ "$rc" == 37 ]]
 stages=("$DEPLOY_TEST_REMOTE"/*)
 [[ ${#stages[@]} == 1 && "${stages[0]}" == "$second_stage" ]]

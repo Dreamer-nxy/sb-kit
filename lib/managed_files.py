@@ -6,8 +6,6 @@ import shutil
 import sys
 from pathlib import Path
 
-from config_gen import ALL_MANAGED_RULE_FILES
-
 
 NODE = re.compile(r"(vless-reality|hy2|naive|anytls|ss2022|socks)-([1-9][0-9]{0,4})")
 
@@ -121,14 +119,6 @@ def remove_nodes(config, state, logs, backup, legacy):
             discard(acme / part)
         empty_dir(acme)
     rules = config / "rules"
-    if rules.is_dir() and not rules.is_symlink():
-        for name in sorted(ALL_MANAGED_RULE_FILES):
-            target = rules / name
-            if target.is_symlink():
-                continue
-            original = backup / "etc-sing-box/rules" / name if backup else None
-            if target.exists() or (original and (original.is_file() or original.is_symlink())):
-                discard(target, original)
     if not legacy:
         for path in logs.glob("error.log*"):
             if re.fullmatch(r"error\.log(?:\.\d+(?:\.gz)?)?", path.name):

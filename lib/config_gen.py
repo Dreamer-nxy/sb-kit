@@ -44,7 +44,7 @@ PROTO_LABELS = {
 }
 
 CN_MODES = ("off", "on")
-GEOSITE_SRS_BASE = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
+GEOSITE_SRS_BASE = "https://raw.githubusercontent.com/SagerNet/sing-geosite"
 
 # Upstream v2fly / SagerNet fine-grained CN categories (mirrors the audited
 # Dufu egress policy: blocks CN entertainment/media/netdisk/social/banks/PT
@@ -131,13 +131,13 @@ _DOMAIN_RE = re.compile(
 )
 
 
-def route_plan_for_mode(mode: str) -> List[Tuple[str, str, str]]:
+def route_plan_for_mode(mode: str, revision: str = "rule-set") -> List[Tuple[str, str, str]]:
     """Return (rule_set_tag, filename, download_url) tuples required for mode."""
     if mode == "off":
         return []
     if mode == "on":
         return [
-            (f"geosite-{tag}", f"geosite-{tag}.srs", f"{GEOSITE_SRS_BASE}/geosite-{tag}.srs")
+            (f"geosite-{tag}", f"geosite-{tag}.srs", f"{GEOSITE_SRS_BASE}/{revision}/geosite-{tag}.srs")
             for tag in CN_BLOCK_GEOSITE_TAGS
         ]
     raise ValueError(f"unsupported CN route mode: {mode!r}")
@@ -158,7 +158,7 @@ def normalize_domain(raw: str) -> str:
     return domain
 
 
-def load_domain_list(path: Optional[Path]) -> List[str]:
+def load_domain_list(path: Optional[Path], ignore_invalid: bool = False) -> List[str]:
     if not path or not path.is_file():
         return []
     seen = set()
@@ -170,6 +170,8 @@ def load_domain_list(path: Optional[Path]) -> List[str]:
         try:
             dom = normalize_domain(line)
         except ValueError as exc:
+            if ignore_invalid:
+                continue
             raise ValueError(f"{path}:{lineno}: {exc}") from exc
         if dom not in seen:
             seen.add(dom)
@@ -478,89 +480,290 @@ def build_tls_object(
     return tls, extra_meta
 
 
-def cmd_base_config(args: argparse.Namespace) -> int:
-    rules: List[Dict[str, Any]] = [
-        {"action": "sniff", "timeout": "300ms"},
-        {"ip_is_private": True, "action": "reject"},
-        {"port": [25], "action": "reject"},
-        {"protocol": "bittorrent", "action": "reject"},
-    ]
-    route: Dict[str, Any] = {
-        "rules": rules,
-        "final": "direct",
+# The tag is an ownership marker that survives both a lost route-state file and
+# an operator changing adjacent rules. It is part of the sing-box schema.
+CN_DOMAIN_GROUPS = (
+    ("sbkit-cn-user-allow", "route"),
+    ("sbkit-cn-user-block", "reject"),
+    ("sbkit-cn-builtin-allow", "route"),
+    ("sbkit-cn-extra-block", "reject"),
+)
+BASE_RULES = [
+    {"action": "sniff", "timeout": "300ms"},
+    {"ip_is_private": True, "action": "reject"},
+    {"port": [25], "action": "reject"},
+    {"protocol": "bittorrent", "action": "reject"},
+]
+
+
+def cn_action(condition: Dict[str, Any], action: str, direct_tag: Optional[str] = "direct") -> Dict[str, Any]:
+    rule = dict(condition, action=action)
+    if action == "route" and direct_tag:
+        rule["outbound"] = direct_tag
+    return rule
+
+
+def cn_local_set(tag: str, path: Path) -> Dict[str, Any]:
+    return {"tag": tag, "type": "local", "format": "binary", "path": str(path)}
+
+
+def canonical_cn_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+    # sing-box format emits scalars for one-item match lists.
+    normalized = {
+        k: [v] if k in ("domain_suffix", "rule_set", "port") and isinstance(v, (str, int)) else v
+        for k, v in rule.items()
     }
+    normalized.setdefault("action", "route")
+    return normalized
 
-    mode = getattr(args, "cn_mode", "off") or "off"
-    rules_dir = Path(args.rules_dir) if getattr(args, "rules_dir", "") else None
-    allow_file = Path(args.allow_file) if getattr(args, "allow_file", "") else None
-    block_file = Path(args.block_file) if getattr(args, "block_file", "") else None
 
+def matches_cn_file(entry: Dict[str, Any], tag: str, path: Path) -> bool:
+    expected = cn_local_set(tag, path)
+    # sing-box format omits the binary format inferred from the .srs suffix.
+    return entry == expected or entry == {k: v for k, v in expected.items() if k != "format"}
+
+
+def cn_policy(args: argparse.Namespace, direct_tag: Optional[str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    rules: Dict[str, Any] = {}
+    sets: Dict[str, Any] = {}
+    if args.cn_mode == "on":
+        if not args.rules_dir:
+            raise ValueError("--cn-mode on requires --rules-dir")
+        allow = load_domain_list(Path(args.allow_file) if args.allow_file else None)
+        block = load_domain_list(Path(args.block_file) if args.block_file else None)
+        plan = route_plan_for_mode("on")
+        for tag, filename, _ in plan:
+            sets[tag] = cn_local_set(tag, Path(args.rules_dir) / filename)
+        for (tag, action), domains in zip(CN_DOMAIN_GROUPS, (allow, block, CN_ALLOW_DOMAINS, CN_BLOCK_EXTRA_DOMAINS)):
+            if tag == "sbkit-cn-extra-block":
+                rules["categories"] = cn_action({"rule_set": [t for t, _, _ in plan]}, "reject")
+            if domains:
+                sets[tag] = {"type": "inline", "tag": tag, "rules": [{"domain_suffix": list(domains)}]}
+                rules[tag] = cn_action({"rule_set": [tag]}, action, direct_tag)
+    elif args.cn_srs:
+        sets["geoip-cn"] = cn_local_set("geoip-cn", Path(args.cn_srs))
+        rules["resolve"] = {"action": "resolve"}
+        rules["geoip-cn"] = cn_action({"rule_set": ["geoip-cn"]}, "reject")
+    return rules, sets
+
+
+def read_base(path: Path) -> Dict[str, Any]:
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("route", {}), dict):
+        raise ValueError(f"{path}: expected an object with a route object")
+    route = cfg.get("route", {})
+    for field in ("rules", "rule_set"):
+        entries = route.get(field, [])
+        if not isinstance(entries, list) or not all(isinstance(r, dict) for r in entries):
+            raise ValueError(f"{path}: route.{field} must be an array of objects")
+    return cfg
+
+
+def cn_owned_entries(route: Dict[str, Any], rules_dir: Path) -> Tuple[str, Dict[int, str], set]:
+    """Identify the generated rules by both their source and their use."""
+    rules = [canonical_cn_rule(r) for r in route.get("rules", [])]
+    definitions = {r["tag"]: r for r in route.get("rule_set", []) if isinstance(r.get("tag"), str)}
+    plan = route_plan_for_mode("on")
+    categories = [tag for tag, _, _ in plan]
+    bundle_rule = cn_action({"rule_set": categories}, "reject")
+    all_local = all(matches_cn_file(definitions.get(t, {}), t, rules_dir / f) for t, f, _ in plan)
+    owned: Dict[int, str] = {}
+    if all_local and bundle_rule in rules:
+        # Identify the complete builtin allow / category reject / extra reject
+        # group. A user can independently reference the same local category
+        # files, or add an identical reject outside that group.
+        group_positions = {}
+        for tag, action in CN_DOMAIN_GROUPS:
+            group = definitions.get(tag, {})
+            clauses = group.get("rules", [])
+            if (group.get("type", "inline") == "inline" and isinstance(clauses, list) and len(clauses) == 1
+                    and isinstance(clauses[0], dict) and set(clauses[0]) == {"domain_suffix"}):
+                group_positions[tag] = [
+                    i for i, r in enumerate(rules)
+                    if r == cn_action({"rule_set": [tag]}, action, r.get("outbound"))
+                ]
+        builtin_tag = "sbkit-cn-builtin-allow"
+        extra_tag = "sbkit-cn-extra-block"
+        tagged = bool(group_positions.get(builtin_tag) and group_positions.get(extra_tag))
+        if not tagged:
+            # The first v0.3.0 generator used literal domain_suffix clauses.
+            builtin = cn_action({"domain_suffix": list(CN_ALLOW_DOMAINS)}, "route")
+            extra = cn_action({"domain_suffix": list(CN_BLOCK_EXTRA_DOMAINS)}, "reject")
+            group_positions = {
+                builtin_tag: [i for i, r in enumerate(rules) if r == builtin],
+                extra_tag: [i for i, r in enumerate(rules) if r == extra],
+            }
+
+        candidates = []
+        for i, r in enumerate(rules):
+            if r != bundle_rule:
+                continue
+            before = [j for j in group_positions[builtin_tag] if j < i]
+            after = [j for j in group_positions[extra_tag] if j > i]
+            if before and after:
+                candidates.append((after[0] - before[-1], before[-1], i, after[0]))
+        if candidates:
+            _, builtin_i, category_i, extra_i = min(candidates)
+            owned.update({builtin_i: builtin_tag, category_i: "categories", extra_i: extra_tag})
+            tags = set(categories)
+            if tagged:
+                tags.update((builtin_tag, extra_tag))
+                for tag, _ in CN_DOMAIN_GROUPS[:2]:
+                    preceding = [i for i in group_positions.get(tag, []) if i < builtin_i]
+                    if preceding:
+                        owned[preceding[-1]] = tag
+                        tags.add(tag)
+            return "on", owned, tags
+    legacy = "geoip-cn"
+    rule = cn_action({"rule_set": [legacy]}, "reject")
+    if matches_cn_file(definitions.get(legacy, {}), legacy, rules_dir / "geoip-cn.srs") and rule in rules:
+        i = rules.index(rule)
+        owned[i] = legacy
+        return "legacy", owned, {legacy}
+    return "off", owned, set()
+
+
+def rule_set_references(value: Any) -> set:
+    """Find rule_set conditions including logical rules and DNS routing."""
+    tags = set()
+    if isinstance(value, list):
+        for item in value:
+            tags.update(rule_set_references(item))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key == "rule_set":
+                if isinstance(item, str):
+                    tags.add(item)
+                elif isinstance(item, list):
+                    tags.update(tag for tag in item if isinstance(tag, str))
+            else:
+                tags.update(rule_set_references(item))
+    return tags
+
+
+def merge_cn_policy(cfg: Dict[str, Any], args: argparse.Namespace, source_dir: Path) -> None:
+    route = cfg.setdefault("route", {})
+    old_rules = route.get("rules", [])
+    _, owned, owned_tags = cn_owned_entries(route, source_dir)
+    # A customised installation can rename or remove the stock direct
+    # outbound. Its configured default remains the destination for allowed
+    # traffic if no explicitly tagged direct egress exists.
+    outbounds = cfg.get("outbounds", [])
+    if not isinstance(outbounds, list) or not all(isinstance(o, dict) for o in outbounds):
+        raise ValueError("outbounds must be an array of objects")
+    direct_tags = [o["tag"] for o in outbounds if o.get("type") == "direct" and o.get("tag")]
+    default_tag = route.get("final") or (outbounds[0].get("tag") if outbounds else None)
+    direct_tag = "direct" if "direct" in direct_tags else next(iter(direct_tags), default_tag)
+    new_rules, new_sets = cn_policy(args, direct_tag)
+    # The older unmarked user-list clauses are identified by the actual lists,
+    # independently of adjacent operator-authored domain_suffix rules.
+    builtin_pos = next((i for i, name in owned.items() if name == "sbkit-cn-builtin-allow"), None)
+    if builtin_pos is not None and "domain_suffix" in old_rules[builtin_pos]:
+        old_prefix = [canonical_cn_rule(r) for r in old_rules[:builtin_pos]]
+        for (tag, action), file in zip(CN_DOMAIN_GROUPS[:2], (args.old_allow_file, args.old_block_file)):
+            if not file:
+                continue
+            # Invalid lines in a manually edited list do not block off. Use
+            # positive matches only: identical-looking operator rules have no
+            # provenance marker in old v0.3.0 configurations.
+            try:
+                entries = load_domain_list(Path(file), ignore_invalid=True)
+            except (OSError, UnicodeError):
+                entries = []
+            candidate = cn_action({"domain_suffix": entries}, action)
+            if entries and candidate in old_prefix:
+                pos = max(i for i, r in enumerate(old_prefix) if r == candidate)
+                owned[pos] = tag
+
+    # Replace each owned position so that interleaved operator rules retain
+    # their precedence. Insert newly enabled groups before the next owned group.
+    ordered = list(new_rules)
+    result = []
+    cursor = 0
+    if owned:
+        last_owned = max(owned)
+        for i, rule in enumerate(old_rules):
+            role = owned.get(i)
+            if role is None:
+                result.append(rule)
+            elif role in new_rules:
+                stop = ordered.index(role) + 1
+                result.extend(new_rules[name] for name in ordered[cursor:stop])
+                cursor = max(cursor, stop)
+            if i == last_owned:
+                result.extend(new_rules[name] for name in ordered[cursor:])
+                cursor = len(ordered)
+    else:
+        pos = max((i + 1 for i, rule in enumerate(old_rules) if canonical_cn_rule(rule) in BASE_RULES), default=0)
+        result = old_rules[:pos] + list(new_rules.values()) + old_rules[pos:]
+    if result or "rules" in route:
+        route["rules"] = result
+
+    needed = rule_set_references(result) | rule_set_references(cfg.get("dns", {}))
+    kept = []
+    for entry in route.get("rule_set", []):
+        tag = entry.get("tag")
+        if tag in owned_tags:
+            if tag in new_sets:
+                kept.append(new_sets.pop(tag))
+            elif tag in needed:
+                kept.append(entry)
+        elif tag in new_sets:
+            # A shared set kept at 'off' can be adopted again only when the
+            # definition matches the local file in the live managed directory.
+            if not matches_cn_file(entry, tag, source_dir / (tag + ".srs")) and entry != new_sets[tag]:
+                raise ValueError(f"route.rule_set tag conflicts with an existing operator rule set: {tag}")
+            kept.append(new_sets.pop(tag))
+        else:
+            kept.append(entry)
+    kept.extend(new_sets.values())
+    if kept:
+        route["rule_set"] = kept
+    elif owned_tags:
+        route.pop("rule_set", None)
+
+
+def cmd_base_config(args: argparse.Namespace) -> int:
     try:
-        user_allow = load_domain_list(allow_file)
-        user_block = load_domain_list(block_file)
-    except ValueError as exc:
+        if args.existing_config:
+            source = Path(args.existing_config)
+            cfg = read_base(source)
+            live_dir = Path(args.existing_rules_dir) if args.existing_rules_dir else source.parent / "rules"
+        else:
+            cfg = {
+                "log": {"output": args.log_file, "level": args.log_level, "timestamp": True},
+                "outbounds": [{"tag": "direct", "type": "direct"}],
+                "route": {"rules": list(BASE_RULES), "final": "direct"},
+            }
+            live_dir = Path(args.rules_dir or ".")
+        merge_cn_policy(cfg, args, live_dir)
+        atomic_write_json(Path(args.out), cfg, mode=0o640)
+    except (ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    return 0
 
-    if mode == "on":
-        if not rules_dir:
-            print("ERROR: --cn-mode on requires --rules-dir", file=sys.stderr)
-            return 1
-        plan = route_plan_for_mode("on")
-        route["rule_set"] = [
-            {
-                "tag": tag,
-                "type": "local",
-                "format": "binary",
-                "path": str(rules_dir / filename),
-            }
-            for tag, filename, _ in plan
-        ]
-        # Priority: user allow > user block > built-in allow > built-in block.
-        if user_allow:
-            rules.append({"domain_suffix": user_allow, "action": "route", "outbound": "direct"})
-        if user_block:
-            rules.append({"domain_suffix": user_block, "action": "reject"})
-        rules.append({
-            "domain_suffix": list(CN_ALLOW_DOMAINS),
-            "action": "route",
-            "outbound": "direct",
-        })
-        rules.append({"rule_set": [tag for tag, _, _ in plan], "action": "reject"})
-        rules.append({"domain_suffix": list(CN_BLOCK_EXTRA_DOMAINS), "action": "reject"})
-    elif args.cn_srs:
-        # Legacy single-file geoip-cn interface; include resolve so domain requests match.
-        route["rule_set"] = [
-            {
-                "tag": "geoip-cn",
-                "type": "local",
-                "format": "binary",
-                "path": args.cn_srs,
-            }
-        ]
-        rules.append({"action": "resolve"})
-        rules.append({"rule_set": ["geoip-cn"], "action": "reject"})
 
-    cfg = {
-        "log": {
-            "output": args.log_file,
-            "level": args.log_level,
-            "timestamp": True,
-        },
-        "outbounds": [
-            {
-                "tag": "direct",
-                "type": "direct",
-            }
-        ],
-        "route": route,
-    }
-    atomic_write_json(Path(args.out), cfg, mode=0o640)
+def cmd_route_mode(args: argparse.Namespace) -> int:
+    path = Path(args.config)
+    try:
+        if not path.exists():
+            print("off")
+        else:
+            cfg = read_base(path)
+            mode, _, _ = cn_owned_entries(cfg.get("route", {}), Path(args.rules_dir))
+            print(mode)
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
 def cmd_route_plan(args: argparse.Namespace) -> int:
-    for tag, filename, url in route_plan_for_mode(args.mode):
+    if args.commit is not None and not re.fullmatch("[0-9a-f]{40}", args.commit):
+        print("ERROR: --commit must be a full lowercase Git SHA", file=sys.stderr)
+        return 1
+    for tag, filename, url in route_plan_for_mode(args.mode, args.commit or "rule-set"):
         print(f"{tag}|{filename}|{url}")
     return 0
 
@@ -610,11 +813,12 @@ def cmd_route_state(args: argparse.Namespace) -> int:
         data: Dict[str, Any] = {}
         if path.is_file():
             try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-            except ValueError:
-                data = {}
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("expected a JSON object")
+            except (OSError, ValueError) as exc:
+                print(f"ERROR: {path}: {exc}", file=sys.stderr)
+                return 1
         mode = data.get("mode", "")
         if mode == "targeted":
             mode = "on"
@@ -1368,7 +1572,17 @@ def main() -> int:
     p_base.add_argument("--allow-file", default="")
     p_base.add_argument("--block-file", default="")
 
+    p_base.add_argument("--existing-config", default="")
+    p_base.add_argument("--existing-rules-dir", default="")
+    p_base.add_argument("--old-allow-file", default="")
+    p_base.add_argument("--old-block-file", default="")
+
+    p_mode = sub.add_parser("route-mode")
+    p_mode.add_argument("--config", required=True)
+    p_mode.add_argument("--rules-dir", required=True)
+
     p_rplan = sub.add_parser("route-plan")
+    p_rplan.add_argument("--commit")
     p_rplan.add_argument("--mode", required=True, choices=list(CN_MODES))
 
     p_rdom = sub.add_parser("route-domains")
@@ -1447,6 +1661,8 @@ def main() -> int:
         args.cf_token = os.environ.get("SB_CF_TOKEN", "")
     if args.cmd == "base-config":
         return cmd_base_config(args)
+    if args.cmd == "route-mode":
+        return cmd_route_mode(args)
     if args.cmd == "route-plan":
         return cmd_route_plan(args)
     if args.cmd == "route-domains":

@@ -16,7 +16,13 @@ id() { echo 0; }
 systemctl() {
   printf '%s\n' "$*" >>"$WORK/systemctl.calls"
   case "$1" in
-    show) [[ ! -e "$WORK/fragment" ]] || cat "$WORK/fragment" ;;
+    show)
+      [[ ! -e "$WORK/route-bus-failed" ]] || return 1
+      case "$*" in
+        *FragmentPath*sing-box.service) [[ ! -e "$WORK/fragment" ]] || cat "$WORK/fragment" ;;
+        *FragmentPath*sbkit-rules-update*) [[ ! -e "$WORK/route-fragment" ]] || cat "$WORK/route-fragment" ;;
+        *DropInPaths*sbkit-rules-update*) [[ ! -e "$WORK/route-dropins" ]] || cat "$WORK/route-dropins" ;;
+      esac ;;
     is-active|is-enabled) [[ -f "$WORK/$1" ]] ;;
   esac
 }
@@ -30,7 +36,7 @@ set_paths() {
   SB_CTL_DST="$base/bin/sbctl"; SB_LIB_DST="$base/lib"; SB_BACKUP_ROOT="$base/backups"; NFT_DIR="$base/nft"
   TCPFIT_BIN="$base/bin/tcpfit"; PRE_INSTALL_BACKUP=""
   mkdir -p "$base/bin" "$base/units"
-  rm -f "$WORK/fragment" "$WORK/is-active" "$WORK/is-enabled"
+  rm -f "$WORK/fragment" "$WORK/route-bus-failed" "$WORK/route-fragment" "$WORK/route-dropins" "$WORK/is-active" "$WORK/is-enabled"
 }
 
 # The real GitHub response exceeds Linux's per-argument limit.
@@ -190,4 +196,101 @@ cmd_uninstall --keep-tcpfit
 [[ ! -e "${SB_UNIT%/*}/sbkit-rules-update.timer" && ! -e "${SB_UNIT%/*}/sbkit-rules-update.service" ]] || fail "rules update timer survived uninstall"
 [[ ! -e "$SB_RULES_DIR/geosite-category-netdisk-cn.srs" && ! -e "$SB_RULES_DIR/route-state.json" && ! -e "$SB_RULES_DIR/cn-allow.list" ]] || fail "managed route files survived uninstall"
 [[ -f "$SB_RULES_DIR/operator-custom.srs" ]] || fail "operator foreign rule file was deleted"
+# On refuses to shadow existing local or vendor units, including drop-ins not yet loaded.
+set_paths foreign_route
+ensure_singbox_system
+ensure_base_config off 0 1
+unit_dir=${SB_UNIT%/*}
+timer="$unit_dir/sbkit-rules-update.timer"
+updater="$unit_dir/sbkit-rules-update.service"
+touch "$WORK/route-bus-failed"
+if check_route_ownership on; then fail "claimed unit while systemd was unavailable"; fi
+rm "$WORK/route-bus-failed"
+echo /usr/lib/systemd/system/sbkit-rules-update.timer >"$WORK/route-fragment"
+if check_route_ownership on; then fail "accepted foreign vendor unit"; fi
+rm "$WORK/route-fragment"
+echo /run/systemd/system/sbkit-rules-update.service.d/vendor.conf >"$WORK/route-dropins"
+if check_route_ownership on; then fail "accepted loaded external drop-in"; fi
+rm "$WORK/route-dropins"
+mkdir "$timer.d"
+touch "$timer.d/override.conf"
+if check_route_ownership on; then fail "accepted un-reloaded external drop-in"; fi
+rm "$timer.d/override.conf"
+rmdir "$timer.d"
+printf '[Unit]\nDescription=sb-kit weekly CN route rules update timer\n# operator\n' >"$timer"
+printf '[Unit]\nDescription=sb-kit CN route rules auto-updater\n# operator\n' >"$updater"
+if ensure_base_config on 0 1; then fail "overwrote regular operator units"; fi
+custom="$SB_RULES_DIR/geosite-category-netdisk-cn.srs"
+echo operator >"$custom"; chmod 600 "$custom"
+echo operator >"$SB_RULES_DIR/geoip-cn.srs"
+echo example.net >"$SB_RULES_DIR/cn-allow.list"
+if cmd_route allow add new.example.net; then fail "overwrote untracked domain list"; fi
+fix_runtime_perms
+python3 - "$custom" <<'PYMODE'
+import os, stat, sys
+assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600
+PYMODE
+: >"$WORK/systemctl.calls"
+ensure_base_config off 0 1
+cmd_uninstall --keep-tcpfit
+[[ "$(cat "$custom")" == operator && "$(cat "$SB_RULES_DIR/geoip-cn.srs")" == operator ]] || fail "deleted unowned same-name rule"
+[[ "$(cat "$SB_RULES_DIR/cn-allow.list")" == example.net ]] || fail "lost operator list"
+[[ -f "$timer" && -f "$updater" ]] || fail "deleted external units by description"
+if grep -q '^disable.*sbkit-rules-update' "$WORK/systemctl.calls"; then fail "disabled external timer"; fi
+
+# Replacing a previously owned rule or unit transfers its contents back to the operator.
+set_paths changed_route
+ensure_singbox_system
+ensure_base_config on 1 1
+custom="$SB_RULES_DIR/geosite-category-netdisk-cn.srs"
+timer="${SB_UNIT%/*}/sbkit-rules-update.timer"
+echo operator >"$custom"
+echo '# operator' >>"$timer"
+if ensure_base_config on 1 1; then fail "replaced a modified rule"; fi
+cmd_uninstall --keep-tcpfit
+[[ "$(cat "$custom")" == operator && -e "$timer" ]] || fail "deleted manually replaced rule or timer"
+[[ ! -e "${SB_UNIT%/*}/sbkit-rules-update.service" && ! -e "$SB_RULES_DIR/route-state.json" ]] || fail "failed to clean intact owned resources"
+
+# v0.3.0 had plain-text lists with no manifest. Keep the original bytes, owner and mode
+# when adopting them, both on first edit and if a separate upgrade command happens first.
+for first in edit upgrade changed; do
+  set_paths "old_lists_$first"
+  ensure_singbox_system
+  python3 "$LIB_DIR/config_gen.py" base-config --out "$SB_CONFIG" --log-file "$SB_LOG_DIR/error.log" --cn-mode off
+  # sing-box format serializes a one-element port array as a number.
+  if [[ "$first" == upgrade ]]; then
+    python3 - "$SB_CONFIG" <<'PYFORMAT'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+config = json.loads(path.read_text())
+next(r for r in config["route"]["rules"] if r.get("port") == [25])["port"] = 25
+path.write_text(json.dumps(config))
+PYFORMAT
+  fi
+  python3 "$LIB_DIR/config_gen.py" route-state --file "$SB_RULES_DIR/route-state.json" set --mode off
+  custom="$SB_RULES_DIR/cn-allow.list"
+  printf '# handwritten\nExample.net\n' >"$custom"
+  chmod 600 "$custom"
+  if [[ "$first" == upgrade ]]; then ensure_base_config off 0 1; fi
+  cmd_route allow add new.example.net >/dev/null
+  grep -Fxq new.example.net "$custom" || fail "legacy list could not be edited"
+  if [[ "$first" == changed ]]; then echo operator-edited >"$custom"; fi
+  cmd_uninstall --keep-tcpfit
+  if [[ "$first" == changed ]]; then
+    [[ "$(cat "$custom")" == operator-edited ]] || fail "lost operator edit"
+    originals=("$SB_RULES_DIR"/.sb-kit-original-cn-allow.list.*)
+    [[ ${#originals[@]} == 1 && -f "${originals[0]}" ]] || fail "legacy original was not retained"
+    custom="${originals[0]}"
+  fi
+  python3 - "$custom" <<'PYLIST'
+import os, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+assert p.read_bytes() == b"# handwritten\nExample.net\n"
+assert p.stat().st_mode & 0o777 == 0o600
+assert p.stat().st_uid == os.getuid()
+PYLIST
+done
+
 echo "install/uninstall safety OK"

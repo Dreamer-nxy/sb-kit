@@ -30,12 +30,15 @@ done
 [[ $(systemctl show "$service" -p LoadState --value) == not-found ]] || fail "existing service"
 
 echo "== Install sing-box $version through sbctl install"
-bash "$repo/sbctl.sh" install --version "$version" --proto socks --port 39182 \
+bash "$repo/sbctl.sh" install --block-cn --version "$version" --proto socks --port 39182 \
   --ip 127.0.0.1 --no-tune --non-interactive >/dev/null
 [[ $("$core" version | awk 'NR==1 {print $3}') == "$version" ]] || fail "installed version"
 systemctl is-active --quiet "$service" && listening 39182 || fail "initial listener"
 [[ $(systemctl show "$service" -p User --value) == sing-box ]] || fail "runtime user"
-bash "$repo/tests/integration_check.sh" "$core"
+[[ -s "$config/rules/geosite-category-netdisk-cn.srs" ]] || fail "fresh install missing CN rules"
+systemctl is-active --quiet sbkit-rules-update.timer || fail "fresh install missing update timer"
+"$core" check -c "$config/config.json" -C "$config/conf"
+SB_RULES_CACHE_DIR="$config/rules" bash "$repo/tests/integration_check.sh" "$core"
 fixtures=$(mktemp -d)
 trap 'rm -rf "$fixtures"' EXIT
 cp "$core" "$fixtures/native-core"

@@ -44,7 +44,18 @@ echo "== sing-box ${SB_VER}: check (modify + regen)"
 # against real upstream .srs rule-sets when SB_CHECK_CN_RULES != 0.
 if [[ "${SB_CHECK_CN_RULES:-1}" != "0" ]]; then
   R="${SB_RULES_CACHE_DIR:-${WORK}/rules}"
+  installed=0
+  if [[ -f "$R/route-state.json" ]]; then
+    installed=1
+    sha=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["geosite_commit"])' "$R/route-state.json")
+  else
+    sha=$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 30 -H 'Accept: application/vnd.github.sha' \
+      https://api.github.com/repos/SagerNet/sing-geosite/commits/rule-set)
+    R="$R/$sha"
+  fi
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo 'FAIL: missing full rule-set revision' >&2; exit 1; }
   mkdir -p "$R"
+  plan=$(python3 "$GEN" route-plan --mode on --commit "$sha")
   ALLOW="${WORK}/cn-allow.list"
   BLOCK="${WORK}/cn-block.list"
   printf 'example.cn\n' >"$ALLOW"
@@ -53,6 +64,7 @@ if [[ "${SB_CHECK_CN_RULES:-1}" != "0" ]]; then
   while IFS='|' read -r _ fn url; do
     [[ -n "$fn" ]] || continue
     if [[ ! -s "${R}/${fn}" ]]; then
+      [[ "$installed" == 0 ]] || { echo "FAIL: installed rule missing: $fn" >&2; exit 1; }
       dl_ok=0
       for attempt in 1 2 3; do
         if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "${R}/${fn}.part" && [[ -s "${R}/${fn}.part" ]]; then
@@ -65,7 +77,7 @@ if [[ "${SB_CHECK_CN_RULES:-1}" != "0" ]]; then
       done
       [[ "$dl_ok" == "1" ]] || { echo "FAIL: could not download $url" >&2; exit 1; }
     fi
-  done < <(python3 "$GEN" route-plan --mode on)
+  done <<<"$plan"
   python3 "$GEN" base-config --out "${WORK}/config-cn-on.json" --log-file "${WORK}/error.log" \
     --cn-mode on --rules-dir "$R" --allow-file "$ALLOW" --block-file "$BLOCK"
   "$SB_BIN" check -c "${WORK}/config-cn-on.json" -C "$C"

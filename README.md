@@ -3,6 +3,16 @@
 面向自用 VPS 的**纯 `sing-box` + `tcpfit` 精简部署与管理工具**。
 适用系统：`Debian 11+ / Ubuntu 20.04+`（`systemd` + `glibc`，`amd64 / arm64`）。
 
+## 一键安装
+
+在全新的 Debian 或 Ubuntu VPS 上，以 **root** 身份粘贴以下命令。请确认 TCP 443 空闲，并在 VPS 的入站防火墙或云安全组放行该端口。
+
+```bash
+(command -v git >/dev/null || (apt-get update && apt-get install -y git ca-certificates)) && git clone --depth 1 --branch main https://github.com/Dreamer-nxy/sb-kit.git /root/sb-kit && bash /root/sb-kit/sbctl.sh install --proto vless-reality --port 443 --sni auto --no-tune --non-interactive
+```
+
+命令通过公开 HTTPS 拉取代码，自动创建 VLESS-REALITY 节点并启动 sing-box。安装时自动选择 SNI，保留系统当前的 TCP 和 BBR 设置。完成后用 `sbctl links` 查看连接链接，用 `sbctl` 打开管理菜单。
+
 ## 设计原则
 
 - **纯 `sing-box` 单内核**：无 Web 面板、无 Nginx/Caddy、无二维码（仅输出纯净节点链接），自动适配 `sing-box 1.13` 与 `1.14+`（`acme` / `certificate_provider`），并内置 `sbctl regen` 支持跨版本一键重建入站配置。
@@ -23,46 +33,25 @@
 | `ss2022` | `随机高端口` | 中转 / 家宽落地 | 免域名 | `2022-blake3-aes-256-gcm`（SIP002 链接）+ 可选 IPv4/IPv6 `nftables` 白名单 |
 | `socks` | `随机高端口` | 指纹浏览器专用 | 免域名 | 强账密 + 可选 IPv4/IPv6 白名单，附 `ip:port:user:pass` 格式 |
 
-## 私有仓库部署方式
+## 更新已安装的管理工具
 
-### 方式一（最推荐，目标 VPS 不留任何 GitHub Token）
-
-在本地 Mac 仓库目录直接运行 `deploy.sh`，自动打包推送、同步更新远端 `/usr/local/bin/sbctl` 并打开可视化菜单：
+在 VPS 上运行以下命令，更新源码、`sbctl` 和配套脚本。正在运行的 sing-box 会继续使用原配置。
 
 ```bash
-./deploy.sh root@1.2.3.4:22
-# 仅同步更新远端 sbctl 到最新版本：
-./deploy.sh root@1.2.3.4:50222 sync
-# 直接一行无交互一键安装（443 VLESS-REALITY + 自动 BBR 调优）：
-./deploy.sh root@1.2.3.4:50222 install --proto vless-reality --port 443 --bw 500 --sni auto --non-interactive
+cd /root/sb-kit && git pull --ff-only && bash ./sbctl.sh sync
 ```
 
-每次远端部署使用独立的临时目录。如果另一条写命令持有锁，本次操作会报错退出，稍后可以重试。同步会一起切换 `sbctl` 和配套脚本，正在运行的 sing-box 会继续使用原配置。
+如果 v0.2.2 已启用 `geoip-cn`，同步后用 `sbctl route status` 确认当前策略。运行 `sbctl route update` 可迁移到新版域名分类策略，运行 `sbctl route off` 可关闭旧策略。新版将 21 个规则文件固定到同一个上游 Git 提交，`route status` 会显示完整 SHA。停服期间的定时更新在下次启动时生效。
 
-升级旧版管理工具时，在 VPS 的新源码目录里执行 `sudo bash ./sbctl.sh sync`，也可以从本地运行上面的 `deploy.sh … sync`。升级到 v0.2.2 后，在 VPS 的源码目录里直接执行 `sudo sbctl sync` 即可。查看状态、帮助或运行 `add --generate-only` 都可以直接使用源码副本。
+从 v0.2.0 升级时，先同步管理工具，再运行 `sbctl regen` 重建节点。重建会校验全部节点，将原有 SOCKS 和 SS2022 白名单加到 sing-box 的启动依赖中。服务启动失败时会恢复上一套配置。
 
-已有 v0.2.0 节点的机器，先执行 `deploy.sh … sync`，再在 VPS 上运行 `sbctl regen`。重建会先校验全部节点，并把原有 SOCKS 和 SS2022 白名单升级为 sing-box 的启动依赖。服务启动失败时会恢复上一套配置。
-
-接管已有 sing-box 实例时，安装器先备份原配置、核心和服务状态。卸载会检查托管标记，保留手工文件，并按本次接管记录恢复原实例。旧版的空标记未记录原实例归属，历史备份可在 `/var/backups/sb-kit/` 查阅。
-
-### 方式二（在 VPS 上使用只读 Fine-grained PAT 拉取）
-
-```bash
-git clone https://<YOUR_READONLY_PAT>@github.com/<YOU>/sb-kit.git /tmp/sb-kit
-bash /tmp/sb-kit/sbctl.sh
-rm -rf /tmp/sb-kit
-```
-
-> **安全红线**：本仓库仅存放脚本和模板，严禁提交任何服务器 IP、密码、UUID、私钥或 API Token。Cloudflare DNS-01 Token 请通过环境变量 `SB_CF_TOKEN` 或交互隐藏提示传入，避免出现在命令行中。
+接管已有 sing-box 实例时，安装器先备份原配置、核心和服务状态。卸载会检查托管标记，保留手工文件，并按接管记录恢复原实例。早期版本留下的空标记缺少原实例归属记录，可在 `/var/backups/sb-kit/` 查阅历史备份。
 
 ## 常用命令（装完直接敲 `sbctl` 进可视化菜单）
 
 ```bash
 sbctl                                               # 打开终端可视化交互菜单
 sbctl --version                                     # 查看 sb-kit 与 sing-box 版本
-sbctl install --proto vless-reality --port 443 --block-cn
-                                                    # 一键安装（含自动 BBR 调优 + 精准回国阻断）
-sbctl install --no-tune --proto vless-reality       # 已有业务机跳过 BBR 调优
 sbctl route status                                  # 查看回国阻断状态、规则版本与自定义名单
 sbctl route block-cn-on                             # 开启回国阻断（也可用 sbctl route on / off）
 sbctl route allow add example.cn                    # 添加自定义放行域名（最高优先级）
