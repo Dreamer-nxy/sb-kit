@@ -5,13 +5,15 @@
 
 ## 一键安装
 
-在全新的 Debian 或 Ubuntu VPS 上，以 **root** 身份粘贴以下命令。请确认 TCP 443 空闲，并在 VPS 的入站防火墙或云安全组放行该端口。
+在全新的 Debian 或 Ubuntu VPS 上，以 **root** 登录，在 Bash 终端粘贴这一行（需要 `curl`）。请确认 TCP 443 空闲，并在 VPS 的入站防火墙或云安全组放行该端口。
 
 ```bash
-(command -v git >/dev/null || (apt-get update && apt-get install -y git ca-certificates)) && git clone --depth 1 --branch main https://github.com/Dreamer-nxy/sb-kit.git /root/sb-kit && bash /root/sb-kit/sbctl.sh install --proto vless-reality --port 443 --sni auto --no-tune --non-interactive
+(set -o pipefail; curl -fsSL https://github.com/Dreamer-nxy/sb-kit/raw/main/install.sh | bash)
 ```
 
-命令通过公开 HTTPS 拉取代码，自动创建 VLESS-REALITY 节点并启动 sing-box。安装时自动选择 SNI，保留系统当前的 TCP 和 BBR 设置。完成后用 `sb i` 查看节点链接，用 `sb` 打开管理菜单。若已有其他程序占用 `sb`，安装器会显示它的路径并退出。
+安装器会自动补齐 Git 等依赖，通过公开 HTTPS 拉取源码，创建 VLESS-REALITY 节点并启动 sing-box。默认自动选择 SNI，保留当前 TCP 和 BBR 设置，源码保存在 `/root/sb-kit`。若已有其他程序占用 `sb`，安装器会显示它的路径并退出。
+
+**进入管理菜单**：在 VPS 的 SSH 终端输入 `sb`。普通账号用 `sudo sb`。输入 `sb i` 可直接查看节点链接。
 
 ## 常用命令
 

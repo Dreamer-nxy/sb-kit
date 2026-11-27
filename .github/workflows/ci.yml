@@ -14,10 +14,10 @@ jobs:
 
       - name: Bash syntax check
         run: |
-          for script in sbctl.sh deploy.sh lib/*.sh tests/*.sh; do bash -n "$script"; done
+          for script in install.sh sbctl.sh deploy.sh lib/*.sh tests/*.sh; do bash -n "$script"; done
 
       - name: ShellCheck
-        run: shellcheck -S warning sbctl.sh deploy.sh lib/*.sh tests/*.sh
+        run: shellcheck -S warning install.sh sbctl.sh deploy.sh lib/*.sh tests/*.sh
 
       - name: Python compile & unit tests
         run: |
@@ -26,6 +26,7 @@ jobs:
 
       - name: Installer and firewall failure regressions
         run: |
+          sudo bash tests/test_bootstrap.sh
           bash tests/test_install_safety.sh
           bash tests/test_firewall_lifecycle.sh
 
